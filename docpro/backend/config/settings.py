@@ -128,16 +128,31 @@ CHANNEL_LAYERS = {
 #     }
 # }
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': 'doc1',
+#         'USER': 'postgres',
+#         'PASSWORD': 'NewStrongPassword@123',
+#         'HOST': 'localhost',
+#         'PORT': '5433',
+#     }
+# }
+
+
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'doc1',
-        'USER': 'postgres',
-        'PASSWORD': 'NewStrongPassword@123',
-        'HOST': 'localhost',
-        'PORT': '5433',
+        'NAME': 'documentprocessing',
+        'USER': 'xbrl_user',
+        'PASSWORD': 'StrongPassword@2026',
+        'HOST': 'localhost',   # IMPORTANT
+        'PORT': '5432',
     }
 }
+
+
 
 CACHES = {
     'default': {
