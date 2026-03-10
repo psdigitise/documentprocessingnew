@@ -141,17 +141,27 @@ CHANNEL_LAYERS = {
 
 
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': 'documentprocessing',
+#         'USER': 'xbrl_user',
+#         'PASSWORD': 'StrongPassword@2026',
+#         'HOST': 'localhost',   # IMPORTANT
+#         'PORT': '5432',
+#     }
+# }
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'documentprocessing',
+        'NAME': 'docprodb',
         'USER': 'xbrl_user',
         'PASSWORD': 'StrongPassword@2026',
-        'HOST': 'localhost',   # IMPORTANT
+        'HOST': 'localhost',
         'PORT': '5432',
     }
 }
-
 
 
 CACHES = {
@@ -224,7 +234,7 @@ LOGIN_URL = 'login'
 # CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://redis:6379/0')
 # CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 CELERY_BROKER_URL = 'memory://'
-CELERY_RESULT_BACKEND = "db+postgresql://xbrl_user:StrongPassword%402026@localhost:5432/documentprocessing"
+CELERY_RESULT_BACKEND = "db+postgresql://xbrl_user:StrongPassword%402026@localhost:5432/docprodb"
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = False
 CELERY_ACCEPT_CONTENT = ['json']
