@@ -1,0 +1,151 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block title %}Fetch Work - DocPro Resource{% endblock %}
+
+{% block content %}
+<div class="container layout-dashboard" style="max-width: 1200px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+        <div>
+            <h1 style="font-size: 2.5rem; font-weight: 900; text-transform: uppercase; letter-spacing: -0.05em; margin: 0;">
+                My Assignments</h1>
+            <p class="text-muted">Process your assigned page blocks.</p>
+        </div>
+    </div>
+
+    <!-- Active Assignments Block -->
+    <div class="card">
+        <div class="card-header">
+            <h3>Active Tasks</h3>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>File Name</th>
+                            <th>Page Range</th>
+                            <th>Total Pages</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="assignments-container">
+                        <!-- Loaded via JS -->
+                        <tr><td colspan="4" class="text-center p-4">Loading your assignments...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="pagination-controls" style="display: none; justify-content: space-between; align-items: center; padding: 1rem; background: #f8f9fa; border-top: 1px solid #dee2e6;">
+                <div id="page-info" class="text-muted small"></div>
+                <div class="btn-group">
+                    <button id="prev-btn" class="btn btn-sm btn-outline-secondary" onclick="changePage('prev')">Previous</button>
+                    <button id="next-btn" class="btn btn-sm btn-outline-secondary" onclick="changePage('next')">Next</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Use a hidden form for CSRF token access only -->
+<form style="display:none;">{% csrf_token %}</form>
+
+<script src="{% static 'js/realtime.js' %}"></script>
+<script>
+    const assignmentsContainer = document.getElementById('assignments-container');
+    const rt = new RealtimeManager({ role: 'resource' });
+
+    // Handle real-time updates
+    rt.on('assignments_updated', (data) => {
+        if (data.assignments && data.assignments.length > 0) {
+            renderAssignmentBlocks(data.assignments);
+        } else {
+            renderEmptyState();
+        }
+    });
+
+    rt.on('heartbeat_ack', (data) => {
+        console.log('[Heartbeat] Online ✓', data.assigned_pages, 'pages assigned');
+    });
+
+    rt.start();
+    window.addEventListener('beforeunload', () => rt.stop());
+
+    // Original loadAssignments replaced by rt.start()
+    // But we keep the UI rendering logic
+    function renderEmptyState() {
+        assignmentsContainer.innerHTML = `
+            <tr><td colspan="4" class="text-center p-5">
+                <h4 class="text-muted">No Active Assignments</h4>
+                <p class="text-muted">You will see new tasks here when they are assigned to you.</p>
+            </td></tr>`;
+    }
+
+    // Group assignments by document for a cleaner view
+    function renderAssignmentBlocks(assignments) {
+        if (!assignments || assignments.length === 0) {
+            renderEmptyState();
+            return;
+        }
+
+        // 1. Group by doc_ref
+        const groups = {};
+        assignments.forEach(a => {
+            if (!groups[a.doc_ref]) {
+                groups[a.doc_ref] = {
+                    doc_ref: a.doc_ref,
+                    doc_title: a.doc_title,
+                    pages: [],
+                    status: a.status,
+                    workspace_url: a.workspace_url // Will use the first one
+                };
+            }
+            groups[a.doc_ref].pages.push(a.page_number);
+        });
+
+        // 2. Render grouped rows
+        assignmentsContainer.innerHTML = Object.values(groups).map(g => {
+            // Sort pages and format range
+            g.pages.sort((a, b) => a - b);
+            
+            let pageLabel = "";
+            if (g.pages.length === 1) {
+                pageLabel = `Page ${g.pages[0]}`;
+            } else {
+                // Check if contiguous
+                const isContiguous = g.pages.every((p, i) => i === 0 || p === g.pages[i-1] + 1);
+                if (isContiguous) {
+                    pageLabel = `Pages ${g.pages[0]} - ${g.pages[g.pages.length-1]}`;
+                } else {
+                    pageLabel = `Pages ${g.pages.join(', ')}`;
+                }
+            }
+            
+            const totalAssigned = g.pages.length;
+
+            return `
+                <tr>
+                    <td>
+                        <div style="font-weight: 600;">${g.doc_title}</div>
+                        <div style="font-size: 10px; color: #888;">${g.doc_ref}</div>
+                    </td>
+                    <td><span class="badge bg-light text-dark border">${pageLabel}</span></td>
+                    <td>
+                        <span style="font-size: 0.8rem; color: #555;">
+                            ${totalAssigned} page${totalAssigned > 1 ? 's' : ''} assigned
+                        </span>
+                    </td>
+                    <td>
+                         <a href="${g.workspace_url}" class="btn btn-sm" style="color: #CC0000; font-weight: 700; text-decoration: none;">
+                            Process &rarr;
+                        </a>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+
+    // Initial load
+    loadAssignments();
+</script>
+{% endblock %}

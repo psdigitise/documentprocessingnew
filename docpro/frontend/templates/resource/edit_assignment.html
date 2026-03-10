@@ -1,0 +1,884 @@
+{% extends 'base.html' %}
+{% load static %}
+{% block title %}Edit Workspace - {{ assignment.document.file.name }}{% endblock %}
+{% block content %}
+<!-- FontAwesome for standard icons (Localized to avoid tracking blocks) -->
+<link rel="stylesheet" href="{% static 'css/font-awesome/all.min.css' %}">
+<!-- PDF.js CSS (Localized) -->
+<link rel="stylesheet" href="{% static 'lib/pdfjs/pdf_viewer.min.css' %}">
+<style>
+    /* Hide standard navigation for full-screen workspace feel */
+    header, nav, .navbar, .app-sidebar { display: none !important; }
+    #main-content { padding: 0 !important; margin: 0 !important; }
+    
+    body {
+        background-color: #f3f4f6;
+    }
+    
+    .workspace-container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        width: 100vw;
+        overflow: hidden;
+    }
+    
+    /* Toolbar Ribbon styling to look like Word */
+    .word-ribbon {
+        background-color: #ffffff;
+        border-bottom: 1px solid #e1e4e8;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        padding: 8px 16px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        z-index: 1000;
+        height: 56px;
+    }
+    
+    .main-workspace {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        overflow-y: auto;
+        background: #2c2c2c; /* Professional dark background */
+        padding: 40px 0;
+        align-items: center;
+    }
+
+    /* Page container for the layered effect */
+    .document-page-container {
+        position: relative;
+        background: white;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        margin-bottom: 50px;
+        transition: transform 0.2s;
+        flex-shrink: 0; /* CRITICAL: Prevent flexbox from squashing the page height */
+    }
+
+    /* PDF Canvas Layer */
+    .pdf-canvas-layer {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 1;
+    }
+
+    /* PDF Text Layer (Selectable) */
+    .text-layer {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        overflow: hidden;
+        opacity: 0; /* Fully transparent to allow canvas to show through perfectly */
+        line-height: 1.0;
+        z-index: 2;
+        pointer-events: auto; /* Enable selection */
+    }
+
+    .text-layer span {
+        color: transparent;
+        position: absolute;
+        white-space: pre;
+        cursor: text;
+        transform-origin: 0% 0%;
+    }
+
+    .text-layer span::selection {
+        background: rgba(0, 0, 255, 0.2);
+    }
+
+    /* Editor Layer */
+    .editor-layer {
+        position: relative;
+        z-index: 2;
+        width: 100%;
+        height: 100%;
+        background-color: white; /* Solid white background */
+    }
+
+    /* Modern Word-like Ribbon Styles */
+    .editor-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0 20px;
+        background-color: #ffffff;
+        border-bottom: 2px solid #e5e7eb;
+        z-index: 1010;
+        height: 70px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    }
+    .ribbon-group {
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        border-right: 1px solid #e5e7eb;
+        height: 40px;
+        gap: 5px;
+    }
+    .ribbon-group:last-child { border-right: none; }
+    
+    .ribbon-btn {
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 4px;
+        color: #374151;
+        width: 34px;
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.2s;
+        font-size: 0.9rem;
+    }
+    .ribbon-btn:hover {
+        background: #f3f4f6;
+        border-color: #d1d5db;
+        color: #111827;
+    }
+    .ribbon-select {
+        background: #f9fafb;
+        border: 1px solid #d1d5db;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 0.85rem;
+        color: #374151;
+        outline: none;
+        cursor: pointer;
+    }
+    .ribbon-select:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+    
+    .header-left { flex: 0 0 320px; }
+    .header-center { flex: 1; display: flex; justify-content: center; }
+    .header-right { flex: 0 0 320px; justify-content: flex-end; }
+    /* --- Submission Modal --- */
+    .modal-overlay {
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.5);
+        display: none;
+        justify-content: center;
+        align-items: center;
+        z-index: 2000;
+        backdrop-filter: blur(4px);
+    }
+    .modern-modal {
+        background: white;
+        padding: 30px;
+        border-radius: 12px;
+        width: 400px;
+        text-align: center;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        animation: slideUp 0.3s ease-out;
+    }
+    @keyframes slideUp {
+        from { transform: translateY(20px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
+    .modal-icon {
+        font-size: 3rem;
+        color: #3b82f6;
+        margin-bottom: 20px;
+    }
+    .editor-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 5px 20px;
+        background-color: #ffffff;
+        border-bottom: 1px solid #e1e4e8;
+        z-index: 1010;
+        height: 60px;
+    }
+    .header-section {
+        display: flex;
+        align-items: center;
+    }
+    .header-left { flex: 0 0 300px; }
+    .header-center { flex: 1; justify-content: center; overflow: hidden; }
+    .header-right { flex: 0 0 auto; justify-content: flex-end; }
+    
+    .ql-toolbar.ql-snow {
+        border: none !important;
+        padding: 0 !important;
+        background: transparent !important;
+        display: flex;
+        justify-content: center;
+    }
+    .ql-toolbar.ql-snow .ql-formats {
+        margin-right: 10px !important;
+    }
+    
+    /* PDF Table Styling - Absolute Positioned */
+    .pdf-table-container {
+        position: absolute;
+        z-index: 15;
+        background: white;
+        border: 1px solid #ddd;
+        overflow: hidden;
+    }
+    .pdf-table {
+        border-collapse: collapse;
+        table-layout: fixed; /* CRITICAL: Prevent column collapse */
+        width: 100%;
+        height: 100%;
+    }
+    .pdf-table td {
+        border: 1px solid #ccc;
+        padding: 4px;
+        font-size: 11px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap; /* Prevent wrapping unless explicit */
+    }
+    .pdf-table td:focus {
+        outline: 2px solid #3b82f6;
+        z-index: 20;
+        background: #fdfdfd;
+        white-space: normal; /* Allow wrap when editing */
+    }
+
+    /* Enterprise Structured Editor Styles */
+    .interactive-layer {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 5;
+        pointer-events: none;
+    }
+    .interactive-layer * {
+        margin: 0 !important;
+        padding: 0 !important;
+        box-sizing: border-box !important;
+    }
+    .text-block-editable {
+        position: absolute;
+        border: 1px solid transparent;
+        cursor: text;
+        padding: 0;
+        transition: background 0.1s, border 0.1s;
+        overflow: hidden;
+        background: transparent;
+        color: transparent; /* Keep transparent to see PDF, unless edited/hovered */
+        z-index: 10;
+        line-height: 1.1;
+        white-space: pre;
+        pointer-events: auto;
+    }
+    .text-block-editable:hover {
+        background: rgba(59, 130, 246, 0.08); /* Slightly more visible background */
+        color: transparent !important; /* Keep transparent to avoid "double text" */
+        border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    .text-block-editable:focus, .text-block-editable.has-edit {
+        background: white !important; /* Solid to hide PDF text underneath */
+        color: #000 !important;      /* Opaque text */
+        border: 1px solid #3b82f6;
+        outline: none;
+        z-index: 100;
+        overflow: visible; /* Allow expansion during edit */
+    }
+    
+    /* Visual feedback for edits */
+    .just-saved {
+        animation: saveFlash 1.5s ease-out;
+    }
+    @keyframes saveFlash {
+        0% { background-color: rgba(34, 197, 94, 0.2); }
+        100% { background-color: transparent; }
+    }
+</style>
+
+<!-- Submission Confirmation Modal -->
+<div id="submit-modal" class="modal-overlay">
+    <div class="modern-modal">
+        <div class="modal-icon"><i class="fas fa-file-export"></i></div>
+        <h3>Submit Final Work?</h3>
+        <p class="text-muted mb-4">You are about to submit your work. This action is permanent and you will not be able to edit it anymore.</p>
+        <div class="d-flex justify-content-center gap-3">
+            <button class="btn btn-light px-4 border" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary px-4" id="confirm-submit">Confirm & Submit</button>
+        </div>
+    </div>
+</div>
+
+<div style="display:none">{% csrf_token %}</div>
+
+<div class="workspace-container">
+    <div class="editor-header">
+        <!-- LEFT: Document Info -->
+        <div class="header-section header-left">
+            <a href="{% if request.user.role == 'ADMIN' %}{% url 'admin_panel:document_list' %}{% else %}{% url 'resource_fetch' %}{% endif %}" class="btn btn-sm btn-light me-3 border">
+                <i class="fas fa-arrow-left"></i>
+            </a>
+            <div>
+                <h6 class="mb-0 fw-bold" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;">
+                    {% if is_readonly %}RESULT REVIEW{% else %}WORKSPACE{% endif %}: 
+                    <span id="page-indicator" class="text-secondary" style="font-weight: 400;">{{ assignment.document.file.name }}</span>
+                </h6>
+            </div>
+        </div>
+
+        <!-- CENTER: Modern Ribbon Toolbar -->
+        <div class="header-section header-center">
+            <div id="ribbon-toolbar" class="d-flex bg-white border rounded p-1 shadow-sm">
+                <!-- Group 1: Font -->
+                <div class="ribbon-group">
+                    <select class="ribbon-select" style="width: 120px;" title="Font">
+                        <option value="Inter">Inter</option>
+                        <option value="Arial">Arial</option>
+                        <option value="Times New Roman">Times New Roman</option>
+                        <option value="Courier New">Courier New</option>
+                    </select>
+                    <select class="ribbon-select" style="width: 60px;" title="Font Size">
+                        <option value="8pt">8</option>
+                        <option value="9pt">9</option>
+                        <option value="10pt" selected>10</option>
+                        <option value="11pt">11</option>
+                        <option value="12pt">12</option>
+                        <option value="14pt">14</option>
+                        <option value="16pt">16</option>
+                    </select>
+                </div>
+
+                <!-- Group 2: Basic Formatting -->
+                <div class="ribbon-group">
+                    <button class="ribbon-btn" title="Bold" data-command="bold"><i class="fas fa-bold"></i></button>
+                    <button class="ribbon-btn" title="Italic" data-command="italic"><i class="fas fa-italic"></i></button>
+                    <button class="ribbon-btn" title="Underline" data-command="underline"><i class="fas fa-underline"></i></button>
+                    <button class="ribbon-btn" title="Strikethrough" data-command="strikeThrough"><i class="fas fa-strikethrough"></i></button>
+                </div>
+
+                <!-- Group 3: Alignment -->
+                <div class="ribbon-group">
+                    <button class="ribbon-btn" title="Align Left" data-command="justifyLeft"><i class="fas fa-align-left"></i></button>
+                    <button class="ribbon-btn" title="Align Center" data-command="justifyCenter"><i class="fas fa-align-center"></i></button>
+                    <button class="ribbon-btn" title="Align Right" data-command="justifyRight"><i class="fas fa-align-right"></i></button>
+                </div>
+
+                <!-- Group 4: Tables & Lists -->
+                <div class="ribbon-group">
+                    <button class="ribbon-btn" title="Insert Table"><i class="fas fa-table"></i></button>
+                    <button class="ribbon-btn" title="Checklist"><i class="fas fa-list-check"></i></button>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT: Actions -->
+        <div class="header-section header-right">
+            {% if is_readonly %}
+                <span class="badge bg-warning text-dark px-3 py-2" style="font-size: 0.8rem;">
+                    <i class="fas fa-lock me-1"></i> READ-ONLY SNAPSHOT
+                </span>
+            {% else %}
+                <span id="save-status-custom" class="me-3" style="font-size: 0.85rem; font-weight: 500;"></span>
+                <div class="btn-group">
+                    <button class="btn btn-sm btn-outline-info px-3 me-2" id="btn-preview-pdf">
+                        <i class="fas fa-file-pdf me-1"></i> Preview PDF
+                    </button>
+                    <button class="btn btn-sm btn-outline-primary px-3" id="btn-save">
+                        <i class="fas fa-save me-1"></i> Save
+                    </button>
+                    <button class="btn btn-primary btn-sm px-4" id="btn-submit" style="background-color: #d93025; border-color: #d93025;">
+                        <i class="fas fa-paper-plane me-2"></i> Submit
+                    </button>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- MAIN Scrolling Area -->
+    <div class="main-workspace no-scrollbar" id="workspace-scroller">
+        <!-- Document Content will be rendered here dynamically -->
+        <div id="document-loading" style="color: #888; margin-top: 100px; text-align: center;">
+            <div class="spinner-border text-primary mb-3" role="status"></div>
+            <div>Constructing Integrated Layered Workspace...</div>
+        </div>
+    </div>
+</div>
+
+<!-- Professional Localized Libraries -->
+<script src="{% static 'lib/pdfjs/pdf.min.js' %}"></script>
+<script src="{% static 'lib/pdfjs/pdf_viewer.min.js' %}"></script>
+
+<script>
+    let editorSocket;
+    const pdfjsLib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "{% static 'lib/pdfjs/pdf.worker.min.js' %}";
+    
+    // Fix font fetching error with a more robust URL or local fallback if needed
+    const STANDARD_FNT_URL = 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/';
+
+    // --- Single In-Memory Edit State Store ---
+    const editState = {}; // Structure: { [blockId]: { text: string, isDirty: bool, lastSaved: Date } }
+    let autosaveTimer = null;
+
+    function getEditedText(blockId) {
+        return editState[blockId] ? editState[blockId].text : null;
+    }
+
+    function setEditedText(blockId, text, isDirty = true) {
+        if (!editState[blockId]) {
+            editState[blockId] = { text: '', isDirty: false, lastSaved: null };
+        }
+        editState[blockId].text = text;
+        editState[blockId].isDirty = isDirty;
+        if (isDirty) markAsPending();
+    }
+
+    function markSaved(blockId) {
+        if (editState[blockId]) {
+            editState[blockId].isDirty = false;
+            editState[blockId].lastSaved = new Date();
+        }
+    }
+    
+    // Setup WebSocket
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        editorSocket = new WebSocket(
+            protocol + window.location.host + '/ws/workspace/{{ doc_ref }}/{{ page_number }}/'
+        );
+
+        editorSocket.onmessage = function(e) {
+            const data = JSON.parse(e.data);
+            if(data.type === 'save_confirmation') {
+                const status = document.getElementById('save-status-custom');
+                if (status) {
+                    status.innerText = 'Sync Complete';
+                    status.className = 'text-success ms-3';
+                    setTimeout(() => {
+                        if (status.innerText === 'Sync Complete') status.innerText = '';
+                    }, 3000);
+                }
+            } else if (data.type === 'remote_update') {
+                console.log("Remote update received, reload suggested for consistency.");
+            }
+        };
+
+        editorSocket.onclose = function(e) {
+            console.warn('Editor socket closed:', e.code, e.reason);
+            const status = document.getElementById('save-status-custom');
+            if (status) {
+                status.innerHTML = '<i class="fas fa-exclamation-triangle text-muted"></i> Offline Sync';
+            }
+            setTimeout(connectWebSocket, 5000);
+        };
+
+        editorSocket.onerror = function(err) {
+            console.error('WebSocket Error:', err);
+        };
+    }
+    
+    // --- Enterprise Ribbon Functionality ---
+    let lastFocusedBlock = null;
+
+    document.addEventListener('focusin', (e) => {
+        if (e.target.classList.contains('text-block-editable')) {
+            lastFocusedBlock = e.target;
+        }
+    });
+
+    document.querySelectorAll('.ribbon-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const command = btn.getAttribute('data-command');
+            if (!command) return;
+            
+            if (lastFocusedBlock) {
+                lastFocusedBlock.focus();
+                document.execCommand(command, false, null);
+                const blockId = lastFocusedBlock.getAttribute('data-block-id');
+                if (blockId) {
+                    setEditedText(blockId, lastFocusedBlock.innerHTML);
+                    lastFocusedBlock.classList.add('has-edit');
+                    scheduleAutosave(blockId);
+                }
+            }
+        });
+    });
+
+    // Handle selects (Font/Size)
+    document.querySelectorAll('.ribbon-select').forEach(select => {
+        select.addEventListener('change', () => {
+            if (!lastFocusedBlock) return;
+            lastFocusedBlock.focus();
+            const value = select.value;
+            const type = select.getAttribute('title');
+            
+            if (type === 'Font') {
+                document.execCommand('fontName', false, value);
+            } else if (type === 'Font Size') {
+                const span = document.createElement('span');
+                span.style.fontSize = value;
+                const selection = window.getSelection();
+                if (selection.rangeCount) {
+                    const range = selection.getRangeAt(0);
+                    range.surroundContents(span);
+                }
+            }
+            markAsPending();
+        });
+    });
+
+    connectWebSocket();
+
+    /**
+     * BlockLayoutRenderer: Handles fetching and rendering of absolute-positioned
+     * text blocks and structural tables on the workspace.
+     */
+    class BlockLayoutRenderer {
+        constructor(pageId, containerId) {
+            this.pageId = pageId;
+            this.container = document.getElementById(containerId);
+            this.interactiveLayer = this.container.querySelector('.interactive-layer');
+            this.pageWidth = 0;
+            this.pageHeight = 0;
+            this.blocks = [];
+            this.tables = [];
+        }
+
+        async render(cssWidth, cssHeight) {
+            try {
+                // 1. Fetch data with requested dimensions for pre-scaling
+                const resp = await fetch(`/api/v1/processing/pages/${this.pageId}/blocks/?width=${cssWidth}&height=${cssHeight}`);
+                const data = await resp.json();
+
+                this.pageWidth = data.pdf_width;
+                this.pageHeight = data.pdf_height;
+                this.blocks = data.blocks;
+                this.tables = data.tables;
+
+                this.interactiveLayer.innerHTML = '';
+                
+                // 2. Render Tables First (lower Z-index)
+                this.tables.forEach(table => this.renderTable(table, cssWidth, cssHeight));
+
+                // 3. Render Text Blocks
+                this.blocks.forEach(block => this.renderBlock(block));
+
+            } catch (err) {
+                console.error("Renderer failed:", err);
+            }
+        }
+
+        renderBlock(block) {
+            const span = document.createElement('div');
+            span.className = 'text-block-editable';
+            span.id = `block-${block.id}`;
+            span.dataset.id = block.id;
+            span.contentEditable = "{{ is_readonly }}" !== "True";
+            
+            // Map CSS coordinates from API
+            const css = block.css;
+            span.style.left = css.left + 'px';
+            span.style.top = css.top + 'px';
+            span.style.width = css.width + 'px';
+            span.style.height = css.height + 'px';
+            span.style.fontSize = css.font_size + 'px';
+            
+            // Apply font styles - Use data attributes if we need to recall specific colors
+            span.style.fontFamily = block.font_name || 'serif';
+            if (block.font_weight === 'bold') span.style.fontWeight = 'bold';
+            if (block.font_style === 'italic') span.style.fontStyle = 'italic';
+            // span.style.color = block.font_color || '#000000'; // Removed to allow CSS transparency
+
+            // Text content
+            span.innerText = block.current_text || block.original_text || "";
+            if (block.is_dirty) span.classList.add('has-edit');
+
+            // Events
+            span.addEventListener('input', () => this.handleInput(block.id, span.innerText));
+            span.addEventListener('blur', () => this.saveBlock(block.id, span.innerText));
+            
+            this.interactiveLayer.appendChild(span);
+        }
+
+        renderTable(table, cssWidth, cssHeight) {
+            const tableDiv = document.createElement('div');
+            tableDiv.className = 'pdf-table-container';
+            
+            // Scale table container
+            const scaleX = cssWidth / this.pageWidth;
+            const scaleY = cssHeight / this.pageHeight;
+            
+            tableDiv.style.left = (table.x * scaleX) + 'px';
+            tableDiv.style.top = (table.y * scaleY) + 'px';
+            tableDiv.style.width = (table.width * scaleX) + 'px';
+            tableDiv.style.height = (table.height * scaleY) + 'px';
+
+            const htmlTable = document.createElement('table');
+            htmlTable.className = 'pdf-table';
+            
+            table.table_json.forEach((row, rIdx) => {
+                const tr = document.createElement('tr');
+                row.forEach((cell, cIdx) => {
+                    const td = document.createElement('td');
+                    td.innerText = cell;
+                    td.contentEditable = "{{ is_readonly }}" !== "True";
+                    
+                    // Link to cell save if needed
+                    td.addEventListener('blur', () => this.saveTableCell(table.table_ref, rIdx, cIdx, td.innerText));
+                    
+                    tr.appendChild(td);
+                });
+                htmlTable.appendChild(tr);
+            });
+
+            tableDiv.appendChild(htmlTable);
+            this.interactiveLayer.appendChild(tableDiv);
+        }
+
+        handleInput(blockId, text) {
+            const el = document.getElementById(`block-${blockId}`);
+            el.classList.add('has-edit');
+            markAsPending();
+        }
+
+        async saveBlock(blockId, text) {
+            try {
+                const response = await fetch(`/api/v1/processing/blocks/${blockId}/save/`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': getCookie('csrftoken')
+                    },
+                    body: JSON.stringify({ text: text })
+                });
+                if (response.ok) {
+                    const el = document.getElementById(`block-${blockId}`);
+                    el.classList.add('just-saved');
+                    setTimeout(() => el.classList.remove('just-saved'), 2000);
+                }
+            } catch (err) {
+                console.error("Save failed:", err);
+            }
+        }
+
+        async saveTableCell(tableRef, row, col, text) {
+            try {
+                await fetch(`/api/v1/processing/tables/${tableRef}/cell/save/`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': getCookie('csrftoken')
+                    },
+                    body: JSON.stringify({ row: row, col: col, text: text })
+                });
+            } catch (err) {
+                console.error("Cell save failed:", err);
+            }
+        }
+    }
+
+    async function initializeIntegratedWorkspace() {
+        const workspace = document.getElementById('workspace-scroller');
+        const loadingEl = document.getElementById('document-loading');
+
+        try {
+            const contentResponse = await fetch(`/api/v1/processing/workspace/content/{{ doc_ref }}/{{ page_number }}/`);
+            const data = await contentResponse.json();
+            
+            workspace.innerHTML = ''; // Clear loading
+
+            // Process each assigned page
+            for (const pageData of data.pages) {
+                const pageId = pageData.id;
+                
+                // Create Page Container
+                const pageDiv = document.createElement('div');
+                pageDiv.className = 'document-page-container';
+                pageDiv.id = `page-container-${pageId}`;
+                workspace.appendChild(pageDiv);
+
+                // PDF Layer
+                const canvas = document.createElement('canvas');
+                canvas.className = 'pdf-canvas-layer';
+                pageDiv.appendChild(canvas);
+
+                // Interactive Layer
+                const interactiveLayer = document.createElement('div');
+                interactiveLayer.className = 'interactive-layer';
+                pageDiv.appendChild(interactiveLayer);
+
+                // 1. Render PDF background
+                const loadingTask = pdfjsLib.getDocument("{{ assignment.document.file.url }}" || "{{ pdf_url }}");
+                const pdf = await loadingTask.promise;
+                const pdfPage = await pdf.getPage(pageData.page_number);
+                
+                const cssWidth = 850; // Standard workspace width
+                const viewport = pdfPage.getViewport({ scale: cssWidth / pdfPage.view[2] });
+                const cssHeight = viewport.height;
+
+                pageDiv.style.width = cssWidth + 'px';
+                pageDiv.style.height = cssHeight + 'px';
+                canvas.width = cssWidth;
+                canvas.height = cssHeight;
+
+                await pdfPage.render({
+                    canvasContext: canvas.getContext('2d'),
+                    viewport: viewport
+                }).promise;
+
+                // 2. Clear loader and trigger Renderer
+                const renderer = new BlockLayoutRenderer(pageId, pageDiv.id);
+                await renderer.render(cssWidth, cssHeight);
+            }
+            
+            console.log("Layout Overhaul: Workspace initialized via absolute positioning.");
+        } catch (err) {
+            console.error("Initialization failed:", err);
+            loadingEl.innerHTML = `<div class="alert alert-danger">Error: ${err.message}</div>`;
+        }
+    }
+
+    function markAsPending() {
+        const status = document.getElementById('save-status-custom');
+        if (status) status.innerText = 'Changes pending...';
+    }
+
+    function getCookie(name) {
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+                const cookie = cookies[i].trim();
+                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                    cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                    break;
+                }
+            }
+        }
+        return cookieValue;
+    }
+
+    initializeIntegratedWorkspace();
+
+    // --- WebSocket Save Logic ---
+    function saveDocumentContent() {
+        if(!editorSocket || editorSocket.readyState !== WebSocket.OPEN) return;
+        
+        const interactiveLayers = document.querySelectorAll('.interactive-layer');
+        if (interactiveLayers.length === 0) return;
+
+        let aggregatedContent = "";
+        interactiveLayers.forEach(layer => {
+            const pageId = layer.getAttribute('data-page-id');
+            if (!pageId) return;
+            
+            let pageHtml = `<div class="editor-page" data-page-id="${pageId}">`;
+            const blocks = layer.querySelectorAll('.text-block-editable');
+            blocks.forEach(block => {
+                const bbox = block.getAttribute('data-original-bbox');
+                // Sanitize HTML slightly to remove UI classes
+                const cleanHtml = block.innerHTML.replace(/validation-warning/g, '');
+                pageHtml += `<span data-bbox='${bbox}'>${cleanHtml}</span> `;
+            });
+            pageHtml += `</div>`;
+            aggregatedContent += pageHtml;
+        });
+
+        editorSocket.send(JSON.stringify({
+             action: 'save',
+             content: aggregatedContent
+        }));
+    }
+
+    // --- UI Listeners ---
+    if (document.getElementById('btn-save')) {
+        document.getElementById('btn-save').addEventListener('click', function() {
+            saveDocumentContent();
+            if (typeof showToast === 'function') showToast("Saving...", "info");
+        });
+    }
+
+    function closeModal() {
+        const modal = document.getElementById('submit-modal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    if (document.getElementById('btn-submit')) {
+        document.getElementById('btn-submit').addEventListener('click', function () {
+            const modal = document.getElementById('submit-modal');
+            if (modal) modal.style.display = 'flex';
+        });
+    }
+
+    const confirmSubmitBtn = document.getElementById('confirm-submit');
+    if (confirmSubmitBtn) {
+        confirmSubmitBtn.addEventListener('click', async function () {
+            const btn = this;
+            const status = document.getElementById('save-status-custom');
+            closeModal();
+            
+            const btnSubmitOriginal = document.getElementById('btn-submit');
+            if (btnSubmitOriginal) btnSubmitOriginal.disabled = true;
+            if (status) {
+                status.innerText = 'Submitting Block...';
+                status.className = 'text-warning';
+            }
+
+            // 0. Flush any pending granular edits
+            if (typeof flushAllPendingEdits === 'function') flushAllPendingEdits();
+
+            // 1. Final Save via WebSocket
+            saveDocumentContent();
+
+            // 2. Trigger bulk submission via REST
+            try {
+                const csrfToken = getCookie('csrftoken') || (document.querySelector('[name=csrfmiddlewaretoken]') ? document.querySelector('[name=csrfmiddlewaretoken]').value : '');
+                const response = await fetch(`/api/v1/processing/workspace/content/{{ doc_ref }}/{{ page_number }}/submit/`, {
+                    method: 'POST',
+                    headers: {
+                        'X-CSRFToken': csrfToken,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const data = await response.json();
+                if (response.ok && (data.status === 'submitted' || data.block_completed > 0)) {
+                    if (status) {
+                        status.innerText = 'Block Submitted!';
+                        status.className = 'text-success';
+                    }
+                    setTimeout(() => {
+                        const backUrl = "{% if request.user.role == 'ADMIN' %}{% url 'admin_panel:document_list' %}{% else %}{% url 'resource_fetch' %}{% endif %}";
+                        window.location.href = backUrl;
+                    }, 1500);
+                } else {
+                    if (status) {
+                        status.innerText = 'Submission Failed: ' + (data.message || response.status);
+                        status.className = 'text-danger';
+                    }
+                    if (btnSubmitOriginal) btnSubmitOriginal.disabled = false;
+                }
+            } catch (err) {
+                console.error("Submission error:", err);
+                if (status) {
+                    status.innerText = 'Network Error';
+                    status.className = 'text-danger';
+                }
+                if (btnSubmitOriginal) btnSubmitOriginal.disabled = false;
+            }
+        });
+    }
+
+    // --- Persistence on Zoom / Resize ---
+    window.addEventListener('resize', () => {
+        if (window.resizeTimer) clearTimeout(window.resizeTimer);
+        window.resizeTimer = setTimeout(() => {
+            console.log("Window resized, re-rendering workspace...");
+            if (typeof flushAllPendingEdits === 'function') flushAllPendingEdits();
+            initializeIntegratedWorkspace();
+        }, 500);
+    });
+
+</script>
+{% endblock %}
