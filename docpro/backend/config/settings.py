@@ -13,7 +13,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-key-dev-12345')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = ['*','ec2-13-126-44-206.ap-south-1.compute.amazonaws.com']
 
 # Security Settings for Local Development
 SECURE_CROSS_ORIGIN_OPENER_POLICY = None
