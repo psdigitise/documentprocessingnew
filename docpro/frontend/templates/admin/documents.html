@@ -1039,7 +1039,7 @@
 
     async function retryDocument(id) {
         try {
-            showToast('Retrying processing...', 'info');
+            // showToast('Retrying processing...', 'info');
             const response = await fetch(`/api/v1/documents/${id}/retry/`, {
                 method: 'POST',
                 headers: { 'X-CSRFToken': '{{ csrf_token }}' }
