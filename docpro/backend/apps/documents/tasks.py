@@ -5,7 +5,6 @@ from apps.documents.services import DocumentService
 import hashlib
 import logging
 import os
-import pythoncom
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +120,7 @@ def convert_word_to_pdf(self, document_id):
             # METHOD 2: docx2pdf fallback
             try:
                 # Initialize COM for Windows
+                import pythoncom
                 pythoncom.CoInitialize()
                 from docx2pdf import convert
                 convert(str(input_path), str(output_path))
@@ -144,7 +144,9 @@ def convert_word_to_pdf(self, document_id):
                     logger.error(f"Aspose conversion failed: {e3}")
                     raise Exception(f"All conversion methods failed. LO: {e1}, Word: {e2}, Aspose: {e3}")
             finally:
-                try: pythoncom.CoUninitialize()
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
                 except: pass
 
         # ── Step 4: Validating output (70%) ──────────────────
