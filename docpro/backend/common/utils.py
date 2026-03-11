@@ -63,3 +63,27 @@ class SigningService:
             return hmac.compare_digest(expected_signature, signature)
         except (ValueError, TypeError):
             return False
+
+def run_task_background(task_func, *args, **kwargs):
+    """
+    Executes a task in a background thread.
+    Use this as a fallback when Celery broker is unavailable.
+    """
+    import threading
+    from django.db import connection
+    
+    def wrapper():
+        try:
+            # Ensure new thread has fresh connection
+            connection.close()
+            task_func(*args, **kwargs)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Background task failed: {e}", exc_info=True)
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=wrapper)
+    thread.daemon = True # Don't block process exit
+    thread.start()
+    return thread

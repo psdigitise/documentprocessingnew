@@ -253,8 +253,8 @@ def score_page_complexity(self, page_id):
     Scores the complexity of a page.
     """
     try:
-        page = Page.objects.select_for_update().get(id=page_id)
         with transaction.atomic():
+            page = Page.objects.select_for_update().get(id=page_id)
             ComplexityScorer.apply_score(page)
     except Page.DoesNotExist:
         return

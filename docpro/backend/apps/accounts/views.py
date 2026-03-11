@@ -270,9 +270,10 @@ class UserViewSet(viewsets.ModelViewSet):
                     # which will correctly set 'ACTIVE' or 'BUSY' based on load.
                     profile.is_available = True
                     profile.last_active_at = now
+                    profile.last_seen = now # Sync with cleanup task
                     if profile.status == 'INACTIVE':
                         profile.status = 'ACTIVE' # Wake up
-                    profile.save(update_fields=['is_available', 'last_active_at', 'status'])
+                    profile.save(update_fields=['is_available', 'last_active_at', 'last_seen', 'status'])
                     profile.refresh_status()
                     
                 # Keep Redis cache fresh (TTL 90 seconds)
@@ -310,7 +311,11 @@ class CustomLogoutView(LogoutView):
                 profile = user.resource_profile
                 profile.status = 'INACTIVE'
                 profile.is_available = False
-                profile.save(update_fields=['status', 'is_available'])
+                # Force online_status to 'offline' by setting last_seen way back
+                from django.utils import timezone
+                from datetime import timedelta
+                profile.last_seen = timezone.now() - timedelta(days=1)
+                profile.save(update_fields=['status', 'is_available', 'last_seen'])
                 
             from django.core.cache import cache
             cache.delete(f"user:{user.id}:online")

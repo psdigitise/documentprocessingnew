@@ -44,6 +44,8 @@ class User(AbstractUser):
 
     @property
     def is_online(self):
+        if hasattr(self, 'resource_profile'):
+             return self.resource_profile.is_online
         from django.core.cache import cache
         return cache.get(f"user:{self.id}:online") == "true"
 
@@ -179,7 +181,7 @@ class ResourceProfile(models.Model):
         away    → heartbeat within 2min
         offline → no heartbeat > 2min
         """
-        if not self.last_seen:
+        if self.status == ResourceStatus.INACTIVE or not self.last_seen:
             return 'offline'
         from django.utils import timezone
         now = timezone.now()

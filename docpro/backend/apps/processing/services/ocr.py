@@ -110,16 +110,7 @@ class OCRService:
             "tables": []
         }
         
-        # 1. Advanced Table Detection (pdfplumber)
-        try:
-            with pdfplumber.open(page.parent.name) as pdf:
-                plumb_page = pdf.pages[page.number]
-                tables = plumb_page.extract_tables()
-                # We'll map these back to coordinates in a future pass
-                # For now, use fitz for coordinates as it matches our rendering engine
-        except Exception as e:
-            print(f"pdfplumber error: {e}")
-
+        # 1. Advanced Table Detection (fitz)
         tabs = page.find_tables()
         table_bboxes = [list(t.bbox) for t in tabs]
         

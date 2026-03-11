@@ -32,9 +32,15 @@ class AssignmentService:
         """
         from common.enums import ResourceStatus, PageAssignmentStatus
         
+        from datetime import timedelta
+        from django.utils import timezone
+        # Only assign to resources active within the last 5 minutes
+        presence_threshold = timezone.now() - timedelta(minutes=5)
+        
         return ResourceProfile.objects.filter(
             status=ResourceStatus.ACTIVE,
             is_available=True,
+            last_active_at__gte=presence_threshold
         ).annotate(
             # Compute load directly in SQL — no drift possible
             computed_load=Coalesce(
@@ -248,10 +254,35 @@ class AssignmentService:
             # Maintain in-memory load mapping to prevent over-assignment during same transaction
             resource_loads = {r.id: r.current_load for r in resources}
             updated_resources = set()
-
             for item in queue_items:
                 doc = item.document
                 
+                # Pre-fetch all past failed assignments and manual exclusions for this document
+                from apps.processing.models import RejectedPage
+                doc_exclusions = {} # page_id -> set(resource_ids)
+                
+                # 1. Automatic exclusions from past failed assignments
+                past_fails = PageAssignment.objects.filter(
+                    document=doc,
+                    status__in=[
+                        PageAssignmentStatus.REASSIGNED, 
+                        PageAssignmentStatus.TIMED_OUT, 
+                        PageAssignmentStatus.QUALITY_FAILED
+                    ]
+                ).values('page_id', 'resource_id')
+                
+                for pf in past_fails:
+                    pid, rid = pf['page_id'], pf['resource_id']
+                    if rid:
+                        doc_exclusions.setdefault(pid, set()).add(rid)
+
+                # 2. Manual exclusions from RejectedPage records
+                manual_excl = RejectedPage.objects.filter(document=doc).values('page_id', 'excluded_resources__id')
+                for me in manual_excl:
+                    pid, rid = me['page_id'], me['excluded_resources__id']
+                    if rid:
+                        doc_exclusions.setdefault(pid, set()).add(rid)
+
                 # Fetch pending pages
                 pending_pages = Page.objects.filter(
                     document=doc,
@@ -266,23 +297,30 @@ class AssignmentService:
 
                 # Attempt to assign pages to each resource
                 pages_list = list(pending_pages)
-                page_ptr = 0
+                assigned_in_cycle = set() # Track pages assigned in this transaction cycle
                 
                 logger.info(f"Processing Document {doc.id} ({doc.title}) with {len(pages_list)} pending pages.")
                 
                 for res in resources:
-                    if page_ptr >= len(pages_list):
-                        break
+                    # Filter pages that this resource can take (not already assigned in this cycle AND not excluded)
+                    eligible_pages = [
+                        p for p in pages_list 
+                        if p.id not in assigned_in_cycle 
+                        and res.id not in doc_exclusions.get(p.id, set())
+                    ]
+                    
+                    if not eligible_pages:
+                        continue
                     
                     # Calculate how many pages this resource can take using IN-MEMORY load
                     to_assign = AssignmentService.calculate_pages_for_resource(
-                        res, pages_list[page_ptr:], current_load=resource_loads.get(res.id)
+                        res, eligible_pages, current_load=resource_loads.get(res.id)
                     )
                     
                     if to_assign:
                         page_ids = [p.pk for p in to_assign]
                         try:
-                            # Use a sub-transaction point for each assignment attempt so one failure doesn't roll back the whole task run
+                            # Use a sub-transaction point for each assignment attempt
                             with transaction.atomic():
                                 AssignmentService.assign_pages_to_resource(page_ids, res, broadcast=False)
                                 
@@ -290,24 +328,24 @@ class AssignmentService:
                                 block_weight = sum(float(p.complexity_weight or 1.0) for p in to_assign)
                                 resource_loads[res.id] += block_weight
                                 
-                                page_ptr += len(to_assign)
+                                # Mark as assigned in this cycle
+                                for p in to_assign:
+                                    assigned_in_cycle.add(p.id)
+                                    
                                 total_assigned += len(to_assign)
-                                updated_resources.add(res)
-                                
-                                logger.info(f"Assigned {len(page_ids)} pages of {doc.title} to {res.user.username}. New load: {resource_loads[res.id]}")
                         except Exception as e:
-                            logger.error(f"Failed to assign pages to {res.user.username}: {str(e)}")
-                            # Continue to next resource or doc
-                
-                # If all pages of this doc were assigned, mark queue item complete
-                if page_ptr >= len(pages_list):
+                            logger.error(f"Failed to assign pages {page_ids} to resource {res.id}: {e}")
+                            continue
+
+                # If all pages of this doc were assigned in this cycle, mark queue item complete
+                if len(assigned_in_cycle) >= len(pages_list):
                     item.status = QueueStatus.ASSIGNED
                     item.save(update_fields=['status'])
                     doc.pipeline_status = PipelineStatus.IN_PROGRESS
                     doc.save(update_fields=['pipeline_status'])
                     logger.info(f"Document {doc.title} fully assigned and moved to IN_PROGRESS.")
                 else:
-                    logger.info(f"Document {doc.title} partially assigned. {len(pages_list) - page_ptr} pages remaining.")
+                    logger.info(f"Document {doc.title} partially assigned. {len(pages_list) - len(assigned_in_cycle)} pages remaining.")
             
             # Bulk broadcast for all updated resources
             for res in updated_resources:
@@ -350,7 +388,11 @@ class AssignmentService:
             # Use global PageAssignment for query
             excluded_resource_ids = set(PageAssignment.objects.filter(
                 page=page,
-                status__in=[PageAssignmentStatus.REASSIGNED, PageAssignmentStatus.TIMED_OUT]
+                status__in=[
+                    PageAssignmentStatus.REASSIGNED, 
+                    PageAssignmentStatus.TIMED_OUT,
+                    PageAssignmentStatus.QUALITY_FAILED
+                ]
             ).values_list('resource_id', flat=True))
             
             # Also check RejectedPage exclusions (manually marked by admin)

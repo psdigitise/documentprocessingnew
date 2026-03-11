@@ -70,21 +70,27 @@ class DocumentViewSet(viewsets.ModelViewSet):
             import os
             ext = os.path.splitext(doc.original_file.name)[1].lower()
             
+            # Trigger processing task in background to keep upload response fast
+            from common.utils import run_task_background
             if ext in ['.docx', '.doc']:
                 from apps.documents.tasks import convert_word_to_pdf
-                convert_word_to_pdf.delay(doc.id)
+                run_task_background(lambda: convert_word_to_pdf.delay(doc.id))
             else:
                 from apps.documents.tasks import split_document_task
-                split_document_task.delay(doc.id)
+                run_task_background(lambda: split_document_task.delay(doc.id))
             
             headers = self.get_success_headers(serializer.data)
-            return Response(DocumentSerializer(doc).data, status=status.HTTP_201_CREATED, headers=headers)
+            # Pass context for absolute URLs (crucial for nested FileFields)
+            # Use doc from DB to ensure all fields like doc_ref are populated
+            doc.refresh_from_db()
+            response_serializer = DocumentSerializer(doc, context=self.get_serializer_context())
+            return Response(response_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
         except Exception as e:
             import logging
             logger = logging.getLogger(__name__)
             logger.error(f"Upload failed: {str(e)}", exc_info=True)
             return Response(
-                {"error": "Internal server error during upload. Please check logs."}, 
+                {"error": str(e), "detail": "Internal server error during upload."}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     @action(detail=True, methods=['get'], url_path='unassigned-pages')
