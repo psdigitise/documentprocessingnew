@@ -1,6 +1,7 @@
 import logging
 import json
 import itertools
+from datetime import timedelta
 from decimal import Decimal
 from django.db import models
 from django.db import transaction
@@ -32,17 +33,17 @@ class AssignmentService:
         """
         from common.enums import ResourceStatus, PageAssignmentStatus
         
-        from datetime import timedelta
-        from django.utils import timezone
-        # Only assign to resources active within the last 5 minutes
-        presence_threshold = timezone.now() - timedelta(minutes=5)
+        # Only assign to resources active within the last 5 minutes (session threshold)
+        now = timezone.now()
+        presence_threshold = now - timedelta(minutes=5)
+        online_threshold = now - timedelta(seconds=ResourceProfile.ONLINE_THRESHOLD_SECONDS)
         
         return ResourceProfile.objects.filter(
             status=ResourceStatus.ACTIVE,
             is_available=True,
             last_active_at__gte=presence_threshold
         ).annotate(
-            # Compute load directly in SQL — no drift possible
+            # Compute load directly in SQL
             computed_load=Coalesce(
                 Sum(
                     'page_assignments__page__complexity_weight',
@@ -55,11 +56,16 @@ class AssignmentService:
                 ),
                 0.0,
                 output_field=FloatField()
+            ),
+            # Annotation for true online presence (heartbeat within 30s)
+            is_strictly_online=models.Case(
+                models.When(last_seen__gte=online_threshold, then=models.Value(True)),
+                default=models.Value(False),
+                output_field=models.BooleanField()
             )
         ).filter(
-            # Only resources where computed_load < max_capacity
-            computed_load__lt=F('max_capacity')
-        ).order_by('-last_active_at', 'computed_load') # Prioritize recently active users
+            computed_load__lt=models.F('max_capacity')
+        ).order_by('-is_strictly_online', '-last_seen', '-max_capacity')
 
     @staticmethod
     def calculate_pages_for_resource(resource, available_pages, current_load=None):
@@ -410,13 +416,15 @@ class AssignmentService:
             ).exclude(id__in=list(excluded_resource_ids)).select_related('user'))
             
             logger.info(f"Reassigning Page {page.page_number}. Excluded IDs: {excluded_resource_ids}. Candidate count: {len(candidates)}")
-
             best_candidate = None
             max_score = -float('inf')
+            
+            # Source of truth for online status in DB
+            now = timezone.now()
+            online_limit = now - timedelta(seconds=ResourceProfile.ONLINE_THRESHOLD_SECONDS)
 
             for cand in candidates:
-                # Redis-based presence priority
-                is_online = cache.get(f"user:{cand.user.id}:online") == "true"
+                is_online = cand.last_seen and cand.last_seen >= online_limit
                 presence_bonus = 10000 if is_online else 0
                 
                 cap = cand.max_capacity - cand.current_load
@@ -426,11 +434,14 @@ class AssignmentService:
                         max_score = score
                         best_candidate = cand
             
-            # If still no candidate (e.g. all at full capacity), pick ANY available resource regardless of capacity
+            # 2.5 Fallback: If no one has capacity, pick anyone Online, otherwise anyone available
             if not best_candidate:
-                for cand in candidates:
-                    best_candidate = cand
-                    break
+                # Try finding any Online candidate first even if at capacity (to handle urgent reassignments)
+                best_candidate = next((c for c in candidates if c.last_seen and c.last_seen >= online_limit), None)
+                
+            if not best_candidate:
+                # Absolute fallback: First available candidate
+                best_candidate = next(iter(candidates), None)
 
             if not best_candidate:
                 # Add back into queue for assign_pages task to pick up later

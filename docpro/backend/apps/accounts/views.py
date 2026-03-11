@@ -1,3 +1,4 @@
+from datetime import timedelta
 from django.utils import timezone
 from rest_framework import viewsets, permissions, status, views
 from rest_framework.response import Response
@@ -312,8 +313,6 @@ class CustomLogoutView(LogoutView):
                 profile.status = 'INACTIVE'
                 profile.is_available = False
                 # Force online_status to 'offline' by setting last_seen way back
-                from django.utils import timezone
-                from datetime import timedelta
                 profile.last_seen = timezone.now() - timedelta(days=1)
                 profile.save(update_fields=['status', 'is_available', 'last_seen'])
                 
