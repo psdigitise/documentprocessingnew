@@ -25,8 +25,8 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 
 # Increase upload limits for better performance with large PDFs
-FILE_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50MB
-DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600  # 100MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600  # 100MB
 FILE_UPLOAD_PERMISSIONS = 0o644
 CSRF_COOKIE_HTTPONLY = False  # Allow JS to read CSRF for debugging/AJAX
 CSRF_COOKIE_SAMESITE = 'Lax'
@@ -155,11 +155,11 @@ CHANNEL_LAYERS = {
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'docprodb',
-        'USER': 'xbrl_user',
-        'PASSWORD': 'StrongPassword@2026',
+        'NAME': 'doc1',
+        'USER': 'postgres',
+        'PASSWORD': 'NewStrongPassword@123',
         'HOST': 'localhost',
-        'PORT': '5432',
+        'PORT': '5433',
     }
 }
 
@@ -231,12 +231,11 @@ LOGOUT_REDIRECT_URL = 'home'
 LOGIN_URL = 'login'
 
 # Celery Configuration
-# CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://redis:6379/0')
-# CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+# Temporarily reverted to synchronous mode because Redis is not running
 CELERY_BROKER_URL = 'memory://'
-CELERY_RESULT_BACKEND = "db+postgresql://xbrl_user:StrongPassword%402026@localhost:5432/docprodb"
+CELERY_RESULT_BACKEND = 'db+postgresql://postgres:NewStrongPassword%40123@localhost:5433/doc1'
 CELERY_TASK_ALWAYS_EAGER = True
-CELERY_TASK_EAGER_PROPAGATES = False
+CELERY_TASK_EAGER_PROPAGATES = True
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
@@ -252,7 +251,7 @@ CELERY_BEAT_SCHEDULE = {
 # REST Framework
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        # 'rest_framework.authentication.BasicAuthentication',
+        'rest_framework.authentication.BasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
