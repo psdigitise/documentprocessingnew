@@ -944,15 +944,15 @@
                 <button onclick="event.stopPropagation(); retryDocument('${doc.id}')" class="ac-btn btn-retry">Retry</button>`;
             }
 
-            if (doc.pipeline_status === 'ALL_SUBMITTED' || (doc.pipeline_status === 'MERGED' && !doc.final_file)) {
-                actions += `
-                <button onclick="event.stopPropagation(); handleAction('${doc.id}', 'approve')" class="ac-btn btn-approve">Approve</button>`;
-            }
+            // if (doc.pipeline_status === 'ALL_SUBMITTED' || (doc.pipeline_status === 'MERGED' && !doc.final_file)) {
+            //     actions += `
+            //     <button onclick="event.stopPropagation(); handleAction('${doc.id}', 'approve')" class="ac-btn btn-approve">Approve</button>`;
+            // }
 
-            if (doc.pipeline_status === 'MERGED' || doc.pipeline_status === 'REVIEWING') {
-                actions += `
-                <button onclick="event.stopPropagation(); handleAction('${doc.doc_ref || doc.id}', 'reject')" class="ac-btn btn-reject-main">Reject</button>`;
-            }
+            // if (doc.pipeline_status === 'MERGED' || doc.pipeline_status === 'REVIEWING') {
+            //     actions += `
+            //     <button onclick="event.stopPropagation(); handleAction('${doc.doc_ref || doc.id}', 'reject')" class="ac-btn btn-reject-main">Reject</button>`;
+            // }
 
             const downloadBtnClass = doc.final_file ? 'btn-download' : 'disabled';
             const downloadBtnDisabled = doc.final_file ? '' : 'pointer-events:none; opacity:0.5;';
@@ -1285,7 +1285,7 @@
             });
         }
     });
- 
+
     async function executeBlockAction(assignmentId, action) {
         let reason = '';
         if (action === 'reject') {
@@ -1297,19 +1297,19 @@
         if (!confirm(confirmMsg)) return;
 
         try {
-            const url = action === 'approve' 
-                ? `/api/v1/processing/admin/assignments/${assignmentId}/approve/` 
+            const url = action === 'approve'
+                ? `/api/v1/processing/admin/assignments/${assignmentId}/approve/`
                 : `/api/v1/processing/admin/assignments/${assignmentId}/reject/`;
-            
+
             const response = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'X-CSRFToken': '{{ csrf_token }}',
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ 
+                body: JSON.stringify({
                     reason: action === 'reject' ? 'QUALITY_FAIL' : '',
-                    notes: reason 
+                    notes: reason
                 })
             });
 
