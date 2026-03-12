@@ -26,69 +26,52 @@ class MergeService:
             document = Document.objects.select_for_update().get(id=document.id)
             
             # 1. Validation check
-            if document.pipeline_status in [PipelineStatus.MERGED, PipelineStatus.APPROVED]:
+            if document.pipeline_status == PipelineStatus.APPROVED and document.final_file:
                 return
                 
-            total_pages = document.total_pages
-            approved_submissions = SubmittedPage.objects.filter(
+            total_pages = document.total_pages or 0
+            if total_pages == 0:
+                raise ValueError("Document has no pages recorded.")
+
+            approved_qs = SubmittedPage.objects.filter(
                 document=document, 
                 review_status=ReviewStatus.APPROVED
             ).order_by('page_number', '-submitted_at', '-id').distinct('page_number')
             
-            if approved_submissions.count() != total_pages:
-                raise ValueError(f"Cannot merge: only {approved_submissions.count()} of {total_pages} pages approved.")
+            approved_count = approved_qs.count()
+            if approved_count != total_pages:
+                # Find the gaps for better error reporting
+                found_pages = set(approved_qs.values_list('page_number', flat=True))
+                expected_pages = set(range(1, total_pages + 1))
+                missing = sorted(list(expected_pages - found_pages))
+                raise ValueError(f"Cannot merge: {approved_count}/{total_pages} pages approved. Missing: {missing}")
 
-            # 2. Get or Create MergedDocument tracking record
+            # 2. Get or Create MergedDocument tracking record (Idempotent)
             merged_doc, _ = MergedDocument.objects.get_or_create(document=document)
             
-            if merged_doc.merge_status == MergeStatus.COMPLETED:
-                return
-            
             try:
-                # 3. Perform PyMuPDF Merge
-                source_pdf_path = document.file.path
-                doc_pdf = fitz.open(source_pdf_path)
+                # 3. Perform PyMuPDF Merge (Strict Order Enforcement)
+                doc_pdf = fitz.open() # Create a blank PDF
                 
-                for submission in approved_submissions:
-                    pdf_page_idx = submission.page_number - 1
-                    if pdf_page_idx >= len(doc_pdf): 
-                        continue
-                        
-                    pdf_page = doc_pdf[pdf_page_idx]
+                # We iterate based on the ORIGINAL document sequence to ensure "Correct Order"
+                for page_num in range(1, total_pages + 1):
+                    submission = approved_qs.filter(page_number=page_num).first()
                     
-                    if not submission.final_text:
-                        continue
-                        
-                    soup = BeautifulSoup(submission.final_text, 'html.parser')
-                    # Find all span and td tags with bboxes
-                    elements = soup.find_all(['span', 'td'], attrs={'data-bbox': True})
+                    if not submission:
+                        # This shouldn't happen due to the count check above, but for belt-and-suspenders:
+                        raise ValueError(f"Integrity Error: Approved submission for page {page_num} went missing during merge.")
                     
-                    # Pass 1: Redact
-                    for el in elements:
-                        try:
-                            bbox = json.loads(el['data-bbox'].replace('(', '[').replace(')', ']'))
-                            if not bbox: continue
-                            pdf_page.add_redact_annot(fitz.Rect(bbox), fill=(1,1,1))
-                        except: continue
-                        
-                    pdf_page.apply_redactions()
+                    if not submission.output_page_file:
+                        logger.warning(f"Page {page_num} has no output_page_file. Attempting to bake now.")
+                        from apps.processing.services.pdf_baking import PDFBakeService
+                        baked_content = PDFBakeService.bake_page_edits(submission.page)
+                        filename = f"on_the_fly_p{page_num}_{submission.id}.pdf"
+                        submission.output_page_file.save(filename, ContentFile(baked_content))
                     
-                    # Pass 2: Insert (Use insert_textbox for cells as it is more precise for single blocks)
-                    for el in elements:
-                        try:
-                            bbox = json.loads(el['data-bbox'].replace('(', '[').replace(')', ']'))
-                            if not bbox: continue
-                            text_val = el.get_text().strip()
-                            if text_val:
-                                # Use standard sans-serif (helv) for maximum alignment stability
-                                pdf_page.insert_textbox(
-                                    fitz.Rect(bbox), 
-                                    text_val,
-                                    fontsize=10,
-                                    fontname="helv",
-                                    align=0
-                                )
-                        except: continue
+                    # Open the baked submitted page and append to the final PDF
+                    # Using .open() instead of .path for durability across environments
+                    with fitz.open(stream=submission.output_page_file.read(), filetype="pdf") as page_pdf:
+                        doc_pdf.insert_pdf(page_pdf)
                         
                 # 4. Save to buffer
                 result_buffer = BytesIO()
@@ -105,12 +88,24 @@ class MergeService:
                 merged_doc.merged_by_id = admin_user_id 
                 merged_doc.save()
 
-                # 6. Create ApprovedDocument record (The actual delivered output)
-                ApprovedDocument.objects.create(
+                # 6. Create/Update ApprovedDocument record
+                ApprovedDocument.objects.update_or_create(
                     document=document,
-                    merged_document=merged_doc,
-                    approved_by_id=admin_user_id,
-                    approval_notes="Auto-generated upon completion of all page reviews."
+                    defaults={
+                        'merged_document': merged_doc,
+                        'approved_by_id': admin_user_id,
+                        'approval_notes': "Auto-generated upon completion of all page reviews."
+                    }
+                )
+                
+                # 7. Create Audit Log Entry
+                from apps.audit.models import AuditLog
+                from common.enums import AuditEventType
+                AuditLog.objects.create(
+                    action=AuditEventType.DOC_COMPLETED,
+                    document_id=document.id,
+                    actor_id=admin_user_id,
+                    metadata={'page_count': total_pages}
                 )
                 
                 # 7. Update Document Status

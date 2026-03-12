@@ -138,65 +138,14 @@ class WorkspaceViewSet(viewsets.ViewSet):
             is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
             target_assignment = self._get_assignment(doc_ref, page_number, request.user)
             
-            # Logic for "Bundle" Visibility
+            # 1. Fetch relevant pages based on role
+            # For resources, only show THEIR assigned pages (Block Isolation)
+            # For admins, show the full document context
             if is_admin:
-                # Admins see ALL pages of the document for full audit context
-                all_assignments = PageAssignment.objects.filter(
-                    document__doc_ref=doc_ref
-                ).select_related('page').order_by('page__page_number')
-                
-                # If a page has NO assignment but exists, we still want to show it in the admin block?
-                # For now, let's just show all pages that have ever been assigned or are currently in the document
-                pages_data_map = {}
-                from apps.processing.services.nlp_engine import NLPInspector
-                
-                # 1. Start with all pages in document
                 all_pages = Page.objects.filter(document__doc_ref=doc_ref).order_by('page_number')
-                for p in all_pages:
-                    suggestions = []
-                    try:
-                        suggestions = NLPInspector.analyze_page_structure(p)
-                    except Exception as nlp_err:
-                        logger.warning(f"NLP Analysis failed for page {p.id}: {nlp_err}")
-
-                    blocks = self._get_or_seed_blocks(p)
-                    blocks_data = BlockSerializer(blocks, many=True).data
-                    
-                    tables = p.tables.all()
-                    tables_data = PageTableSerializer(tables, many=True).data
-                    
-                    pages_data_map[p.page_number] = {
-                        'id': p.id,
-                        'page_number': p.page_number,
-                        'text_content': p.text_content,
-                        'layout_data': p.layout_data,
-                        'blocks': blocks_data,
-                        'tables': tables_data,
-                        'suggestions': suggestions,
-                        'image_url': request.build_absolute_uri(p.content_file.url) if p.content_file else None,
-                        'assignment_status': 'UNASSIGNED',
-                        'is_readonly': False # Admins can edited unassigned pages if they want
-                    }
-                
-                # 2. Layer on assignment data
-                for a in all_assignments:
-                    if a.page.page_number in pages_data_map:
-                        # For admins, we only force readonly if they are viewing a page specifically assigned to someone ELSE and that person has submitted?
-                        # Actually, let's just let admins always edit for now.
-                        asgn_readonly = False 
-                        if not is_admin:
-                            asgn_readonly = a.status not in [PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
-                            
-                        pages_data_map[a.page.page_number].update({
-                            'assignment_id': a.id,
-                            'assignment_status': a.status,
-                            'is_readonly': asgn_readonly
-                        })
-                
-                pages_data = [v for k, v in sorted(pages_data_map.items())]
             else:
-                # Resources see their current active block PLUS their historical submitted pages for this doc
-                all_user_assignments = PageAssignment.objects.filter(
+                # Identify all pages assigned to this user for this document (Active or Submitted)
+                assigned_page_ids = PageAssignment.objects.filter(
                     document__doc_ref=doc_ref,
                     resource__user=request.user,
                     status__in=[
@@ -205,37 +154,72 @@ class WorkspaceViewSet(viewsets.ViewSet):
                         PageAssignmentStatus.SUBMITTED,
                         PageAssignmentStatus.APPROVED
                     ]
-                ).select_related('page').order_by('page__page_number')
+                ).values_list('page_id', flat=True)
+                all_pages = Page.objects.filter(id__in=assigned_page_ids).order_by('page_number')
                 
-                pages_data = []
-                from apps.processing.services.nlp_engine import NLPInspector
+                if not all_pages.exists():
+                     # Fallback to the target page only if something is weird
+                     all_pages = [target_assignment.page]
+            
+            # 2. Fetch all assignments for this document to check ownership
+            all_doc_assignments = PageAssignment.objects.filter(
+                document__doc_ref=doc_ref,
+                status__in=[
+                    PageAssignmentStatus.ASSIGNED, 
+                    PageAssignmentStatus.IN_PROGRESS, 
+                    PageAssignmentStatus.SUBMITTED,
+                    PageAssignmentStatus.APPROVED
+                ]
+            ).select_related('page', 'resource__user')
+            
+            # Map assignments by page number for quick lookup
+            assignment_map = {a.page.page_number: a for a in all_doc_assignments}
+            
+            pages_data = []
+            from apps.processing.services.nlp_engine import NLPInspector
+            
+            for p in all_pages:
+                assignment = assignment_map.get(p.page_number)
+                is_assigned_to_me = assignment and assignment.resource.user == request.user
                 
-                for assignment in all_user_assignments:
-                    suggestions = []
+                # Determine readability/editability
+                if is_admin:
+                    # Admins can edit anything that's not submitted/approved 
+                    page_readonly = False 
+                else:
+                    # Resources can ONLY edit pages assigned to them that are active
+                    if is_assigned_to_me:
+                        page_readonly = assignment.status not in [PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+                    else:
+                        page_readonly = True # All other pages in the PDF are read-only context
+                
+                suggestions = []
+                # Performance: Only run NLP analysis for editable pages or admins
+                if is_admin or (is_assigned_to_me and not page_readonly):
                     try:
-                        suggestions = NLPInspector.analyze_page_structure(assignment.page)
-                    except Exception as nlp_err:
-                        logger.warning(f"NLP Analysis failed for assignment {assignment.id}: {nlp_err}")
+                        suggestions = NLPInspector.analyze_page_structure(p)
+                    except: pass
                         
-                    blocks = self._get_or_seed_blocks(assignment.page)
-                    blocks_data = BlockSerializer(blocks, many=True).data
-                    
-                    tables = assignment.page.tables.all()
-                    tables_data = PageTableSerializer(tables, many=True).data
+                blocks = self._get_or_seed_blocks(p)
+                blocks_data = BlockSerializer(blocks, many=True).data
+                
+                tables = p.tables.all()
+                tables_data = PageTableSerializer(tables, many=True).data
 
-                    pages_data.append({
-                        'id': assignment.page.id,
-                        'page_number': assignment.page.page_number,
-                        'text_content': assignment.page.text_content,
-                        'layout_data': assignment.page.layout_data,
-                        'blocks': blocks_data,
-                        'tables': tables_data,
-                        'suggestions': suggestions,
-                        'image_url': request.build_absolute_uri(assignment.page.content_file.url) if assignment.page.content_file else None,
-                        'assignment_id': assignment.id,
-                        'assignment_status': assignment.status,
-                        'is_readonly': assignment.status not in [PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
-                    })
+                pages_data.append({
+                    'id': p.id,
+                    'page_number': p.page_number,
+                    'text_content': p.text_content,
+                    'layout_data': p.layout_data,
+                    'blocks': blocks_data,
+                    'tables': tables_data,
+                    'suggestions': suggestions,
+                    'image_url': request.build_absolute_uri(p.content_file.url) if p.content_file else None,
+                    'assignment_id': assignment.id if assignment else None,
+                    'assignment_status': assignment.status if assignment else 'UNASSIGNED',
+                    'is_readonly': page_readonly,
+                    'is_assigned_to_me': is_assigned_to_me
+                })
 
             return Response({
                 'document': {
@@ -262,7 +246,24 @@ class WorkspaceViewSet(viewsets.ViewSet):
     def preview_baked_pdf(self, request, doc_ref=None, page_number=None):
         """Returns the baked PDF for a specific page with current edits."""
         try:
+            is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
             page = get_object_or_404(Page, document__doc_ref=doc_ref, page_number=page_number)
+
+            if not is_admin:
+                # Ensure the resource user has/had this page assigned and submitted/active
+                has_access = PageAssignment.objects.filter(
+                    page=page,
+                    resource__user=request.user,
+                    status__in=[
+                        PageAssignmentStatus.ASSIGNED,
+                        PageAssignmentStatus.IN_PROGRESS,
+                        PageAssignmentStatus.SUBMITTED,
+                        PageAssignmentStatus.APPROVED
+                    ]
+                ).exists()
+                if not has_access:
+                    return Response({'error': 'Permission denied. You can only view snapshots of your own submitted pages.'}, status=403)
+
             from apps.processing.services.pdf_baking import PDFBakeService
             pdf_content = PDFBakeService.bake_page_edits(page)
             
@@ -631,7 +632,15 @@ def workspace_view(request, doc_ref, page_number):
         ).select_related('document', 'page', 'resource__user')
         
         if not is_admin:
-            assignments = assignments.filter(resource__user=request.user)
+            assignments = assignments.filter(
+                resource__user=request.user,
+                status__in=[
+                    PageAssignmentStatus.ASSIGNED, 
+                    PageAssignmentStatus.IN_PROGRESS, 
+                    PageAssignmentStatus.SUBMITTED,
+                    PageAssignmentStatus.APPROVED
+                ]
+            )
             
         if not assignments.exists():
             # If no assignment, check if the page exists for admin view
@@ -655,9 +664,7 @@ def workspace_view(request, doc_ref, page_number):
         
         # Even if admin, if viewing a submitted page, it's read-only in the editor layer
         
-        pdf_url = assignment.page.document.file.url if assignment.page.document.file else ''
-        if assignment.page.content_file:    
-            pdf_url = assignment.page.content_file.url
+        pdf_url = assignment.document.file.url if assignment.document.file else ''
             
         context = {
             'doc_ref': doc_ref,
@@ -825,6 +832,34 @@ class PageBlocksAPIView(APIView):
     
     def get(self, request, page_id):
         page = get_object_or_404(Page, id=page_id)
+        
+        # Security Check
+        is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
+        if not is_admin:
+            # Resource check: must have at least ONE assignment in this document to view anything
+            has_doc_access = PageAssignment.objects.filter(
+                document=page.document,
+                resource__user=request.user
+            ).exists()
+            
+            if not has_doc_access:
+                return Response({'error': 'Permission denied. You do not have assignments for this document.'}, status=403)
+
+            # Privacy Check: Hide blocks if assigned to someone ELSE
+            is_assigned_to_other = PageAssignment.objects.filter(
+                page=page
+            ).exclude(resource__user=request.user).exists()
+            
+            if is_assigned_to_other:
+                return Response({
+                    'page_id': page_id,
+                    'pdf_width': page.pdf_page_width,
+                    'pdf_height': page.pdf_page_height,
+                    'blocks': [],
+                    'tables': [],
+                    'is_hidden_context': True
+                })
+
         blocks = page.blocks.all().order_by('y', 'x')
         tables = page.tables.all()
         
@@ -856,6 +891,18 @@ class BlockSaveView(APIView):
     
     def patch(self, request, block_id):
         block = get_object_or_404(Block, id=block_id)
+
+        # Security Check: Must be the active assignee
+        is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
+        if not is_admin:
+            has_active = PageAssignment.objects.filter(
+                page=block.page,
+                resource__user=request.user,
+                status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+            ).exists()
+            if not has_active:
+                return Response({'error': 'Permission denied. This block is not currently assigned to you for editing.'}, status=403)
+
         text = request.data.get('text', '')
         
         block.current_text = text
@@ -889,6 +936,17 @@ class TableCellSaveView(APIView):
         
         # Find the specific block
         block = get_object_or_404(Block, table_id=table_id, row_index=row, col_index=col)
+
+        # Security Check
+        is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
+        if not is_admin:
+            has_active = PageAssignment.objects.filter(
+                page=block.page,
+                resource__user=request.user,
+                status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+            ).exists()
+            if not has_active:
+                return Response({'error': 'Permission denied. This table cell is not currently assigned to you for editing.'}, status=403)
         
         block.current_text = text
         block.is_dirty = True
@@ -998,12 +1056,34 @@ class DocumentListRefreshView(APIView):
                 review_status=ReviewStatus.APPROVED
             ).count() if total > 0 else 0
 
+            # Get assignments grouped by resource for "Blocks"
+            from apps.processing.models import PageAssignment
+            from django.db.models import Min, Max
+            resource_assignments = PageAssignment.objects.filter(document=doc).values(
+                'resource__user__username', 'resource__id', 'status'
+            ).annotate(
+                start_page=Min('page__page_number'),
+                end_page=Max('page__page_number'),
+                count=Count('id')
+            ).order_by('start_page')
+
+            assigned_resources = [{
+                'id': PageAssignment.objects.filter(document=doc, resource_id=ra['resource__id']).first().id,
+                'resource_id': ra['resource__id'],
+                'username': ra['resource__user__username'],
+                'start_page': ra['start_page'],
+                'end_page': ra['end_page'],
+                'status': ra['status'],
+                'status_raw': ra['status'],
+            } for ra in resource_assignments]
+
             data.append({
                 'id':                 doc.pk,
                 'doc_ref':            doc.doc_ref,
                 'title':              doc.title or doc.name,
                 'pipeline_status':    doc.pipeline_status,
                 'conversion_status':  doc.conversion_status,
+                'final_file':         doc.final_file.url if doc.final_file else None,
                 'total_pages':        total,
                 'assigned_pages':     assigned,
                 'submitted_pages':    submitted,
@@ -1011,6 +1091,7 @@ class DocumentListRefreshView(APIView):
                 'progress_pct': round((approved / total * 100) if total > 0 else 0, 1),
                 'uploaded_at':  doc.created_at.isoformat(),
                 'uploaded_by':  doc.client.username,
+                'assigned_resources': assigned_resources,
             })
 
         return Response({

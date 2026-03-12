@@ -16,9 +16,18 @@ class DocumentViewSet(viewsets.ModelViewSet):
     parser_classes = (parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser)
 
     def get_queryset(self):
-        # Use .active to only show non-deleted documents by default
-        if self.request.user.role == 'CLIENT':
-            return Document.active.filter(client=self.request.user)
+        user = self.request.user
+        if user.role == 'CLIENT':
+            return Document.active.filter(client=user)
+        
+        # Resources should only see documents they are/were assigned to
+        if user.role == 'RESOURCE' and not (user.is_staff or user.is_superuser):
+            from apps.processing.models import PageAssignment
+            assigned_doc_ids = PageAssignment.objects.filter(
+                resource__user=user
+            ).values_list('document_id', flat=True).distinct()
+            return Document.active.filter(id__in=assigned_doc_ids)
+            
         return Document.active.all()
 
     def destroy(self, request, *args, **kwargs):
@@ -34,17 +43,44 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc_title = document.title or document.name
         
         # 1. Broad Manual Cleanup for un-linked or loosely linked items
-        # AuditLog uses UUIDField (document_id), not ForeignKey
         AuditLog.objects.filter(document_id=doc_id).delete()
         
-        # 2. Hard Delete the document itself
-        # This will trigger database-level CASCADE for:
-        # - Page
-        # - PageAssignment
-        # - DocumentQueue
-        # - SubmittedPage
-        # - MergedDocument
-        # - Block / BlockEdit
+        # 2. Physical File Cleanup from disk (satisfies backend deletion requirement)
+        import os
+        from django.conf import settings
+        
+        # Helper to safely delete file
+        def safe_delete_file(file_obj):
+            if file_obj and hasattr(file_obj, 'path') and os.path.exists(file_obj.path):
+                try:
+                    os.remove(file_obj.path)
+                except Exception as e:
+                    logger.error(f"Failed to delete file {file_obj.path}: {e}")
+
+        # Delete all page-level split files
+        for p in document.pages.all():
+            safe_delete_file(p.content_file)
+            
+        # Delete submitted page blobs
+        from apps.processing.models import SubmittedPage
+        for sp in SubmittedPage.objects.filter(document=document):
+            safe_delete_file(sp.output_page_file)
+            
+        # Delete merged document if exists
+        from apps.processing.models import MergedDocument
+        try:
+            md = MergedDocument.objects.get(document=document)
+            safe_delete_file(md.merged_file)
+        except MergedDocument.DoesNotExist:
+            pass
+
+        # Delete document originals and processing files
+        safe_delete_file(document.original_file)
+        safe_delete_file(document.file)
+        safe_delete_file(document.converted_pdf)
+        safe_delete_file(document.final_file)
+
+        # 3. Hard Delete the document itself (cascades database-level objects)
         document.delete()
         
         return Response({
@@ -231,7 +267,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             'pages': PageSerializer(pages, many=True).data
         })
 
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
     def approve(self, request, pk=None):
         doc = self.get_object()
         from common.enums import PipelineStatus
@@ -281,7 +317,7 @@ class PageViewSet(viewsets.ModelViewSet):
     serializer_class = PageSerializer
     permission_classes = [permissions.IsAuthenticated]
 
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
     def reassign(self, request, pk=None):
         """Manually reassign a page to a specific user"""
         user_id = request.data.get('user_id')
@@ -313,6 +349,7 @@ class PageViewSet(viewsets.ModelViewSet):
             )
             
             # 3. Update Page
+            from common.enums import PageStatus
             page.status = PageStatus.ASSIGNED
             page.current_assignee = target_res.user
             page.save()
@@ -323,7 +360,7 @@ class PageViewSet(viewsets.ModelViewSet):
             
         return Response({'status': 'reassigned', 'resource': target_res.user.username})
 
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
     def reject(self, request, pk=None):
         from common.enums import PageStatus, AuditEventType
         from apps.audit.models import AuditLog
@@ -351,8 +388,20 @@ class BlockUpdateView(views.APIView):
         Granularly save a single block's text.
         Updates Block.current_text and creates a BlockEdit record.
         """
-        # Here block_id parameter in URL should be the UUID 'id' of the Block
         block = get_object_or_404(Block, id=block_id)
+
+        # Security Check: Must be the active assignee or admin
+        is_admin = request.user.role == UserRole.ADMIN or request.user.is_superuser or request.user.is_staff
+        if not is_admin:
+            from apps.processing.models import PageAssignment, PageAssignmentStatus
+            has_active = PageAssignment.objects.filter(
+                page=block.page,
+                resource__user=request.user,
+                status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+            ).exists()
+            if not has_active:
+                return Response({'error': 'Permission denied. Page not assigned or already submitted.'}, status=403)
+
         new_text = request.data.get('text')
         
         if new_text is None:

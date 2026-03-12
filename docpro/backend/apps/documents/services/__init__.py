@@ -81,10 +81,16 @@ class DocumentService:
             
             # Use converted_pdf if available, otherwise original_file
             pdf_file_field = document.file if document.file else document.original_file
-            if not pdf_file_field or not Path(pdf_file_field.path).exists():
+            if not pdf_file_field:
                 raise FileNotFoundError(f"Processing file not found for document {document_id}")
 
-            pdf = fitz.open(pdf_file_field.path)
+            # Open PDF using context manager on the stream for better portability
+            pdf_data = pdf_file_field.read()
+            pdf = fitz.open(stream=pdf_data, filetype="pdf")
+            if pdf.is_encrypted:
+                pdf.close()
+                raise ValueError(f"Document {document_id} is encrypted/password-protected and cannot be split.")
+                
             total = pdf.page_count
             document.total_pages = total
             document.pipeline_status = PipelineStatus.SPLITTING
@@ -108,45 +114,52 @@ class DocumentService:
             pages_to_update = []
             save_jobs = []
 
-            def prepare_page(i):
-                page_num = i + 1
-                try:
-                    # Extract single page
-                    single_pdf = fitz.open()
-                    single_pdf.insert_pdf(pdf, from_page=i, to_page=i)
-                    buffer = io.BytesIO()
-                    single_pdf.save(buffer)
-                    single_pdf.close()
-                    
-                    filename = f'page_{page_num:04d}.pdf'
-                    content = ContentFile(buffer.getvalue(), name=filename)
-
-                    if page_num in existing_pages:
-                        page = existing_pages[page_num]
-                        page.status = PageStatus.PENDING
-                    else:
-                        page = Page(
-                            document=document,
-                            page_number=page_num,
-                            status=PageStatus.PENDING
-                        )
-                    
-                    # Store the content on the object, but don't save yet
-                    return (page, filename, content)
-                except Exception as e:
-                    logger.error(f"Error extracting page {page_num}: {e}")
-                    return None
 
             # 1. Extract pages in parallel (CPU/Memory bound)
+            # pdf_data is already read at line 88
             with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
-                results = list(executor.map(prepare_page, range(total)))
+                # Update prepare_page to take data instead of Global path
+                # For brevity in this refactor, I'll define a local helper
+                def prepare_page_stream(i, data):
+                    page_num = i + 1
+                    try:
+                        local_pdf = fitz.open(stream=data, filetype="pdf")
+                        single_pdf = fitz.open()
+                        single_pdf.insert_pdf(local_pdf, from_page=i, to_page=i)
+                        
+                        buffer = io.BytesIO()
+                        single_pdf.save(buffer)
+                        single_pdf.close()
+                        local_pdf.close()
+                    
+                        filename = f'page_{page_num:04d}.pdf'
+                        content = ContentFile(buffer.getvalue(), name=filename)
+
+                        if page_num in existing_pages:
+                            page = existing_pages[page_num]
+                            page.status = PageStatus.PENDING
+                            page.is_locked = False
+                            page.text_content = ""
+                            # Cleanup old dependencies
+                            from apps.documents.models import Block, PageTable
+                            Block.objects.filter(page=page).delete()
+                            PageTable.objects.filter(page=page).delete()
+                        else:
+                            page = Page(
+                                document=document, page_number=page_num,
+                                status=PageStatus.PENDING, is_locked=False
+                            )
+                        return (page, filename, content)
+                    except Exception as e:
+                        logger.error(f"Error extracting page {page_num}: {e}")
+                        return None
+
+                results = list(executor.map(prepare_page_stream, range(total), [pdf_data]*total))
 
             # 2. Save file content to storage in parallel (I/O bound)
-            # This is where the biggest speedup happens for network drives
             def save_to_storage(result):
                 if not result: return None
                 page, filename, content = result
-                # Write to disk/storage
                 page.content_file.save(filename, content, save=False)
                 return page
 
@@ -160,26 +173,38 @@ class DocumentService:
                     if page.id: # Existing
                         pages_to_update.append(page)
                     else:
-                        pages_to_create.append(page)
+                        # SQLite bulk_create doesn't return IDs, so save individually for new pages
+                        page.save()
+                        pages_to_dispatch.append(page.id)
 
-                if pages_to_create:
-                    created_pages = Page.objects.bulk_create(pages_to_create)
-                    pages_to_dispatch.extend([p.id for p in created_pages])
-                
                 if pages_to_update:
-                    Page.objects.bulk_update(pages_to_update, ['content_file', 'status'])
+                    # Clean up old assignments
+                    from apps.processing.models import PageAssignment
+                    from common.enums import PageAssignmentStatus
+                    PageAssignment.objects.filter(
+                        page__in=pages_to_update,
+                        status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+                    ).update(status=PageAssignmentStatus.REASSIGNED)
+
+                    Page.objects.bulk_update(pages_to_update, [
+                        'content_file', 'status', 'is_locked', 
+                        'current_assignee', 'split_error', 
+                        'layout_data', 'text_content'
+                    ])
                     pages_to_dispatch.extend([p.id for p in pages_to_update])
 
             pdf.close()
 
-            # ✅ Verify integrity
-            actual_count = Page.objects.filter(document=document).count()
-            if actual_count != total:
-                missing = total - actual_count
-                document.pipeline_error = f"{missing} pages failed to split. Errors: {errors}"
-                document.pipeline_status = PipelineStatus.FAILED
+            # ✅ Final verification using the global Integrity Service
+            from apps.processing.services.core import AssignmentService
+            is_valid, integrity_msg = AssignmentService.validate_document_integrity(document)
+            
+            if not is_valid:
+                document.pipeline_error = integrity_msg
                 document.status = DocumentStatus.FAILED
+                document.pipeline_status = PipelineStatus.FAILED
                 document.save(update_fields=['pipeline_error', 'pipeline_status', 'status'])
+                logger.error(f"Post-Split Integrity Verification Failed for {document_id}: {integrity_msg}")
                 return
 
             # ✅ Section 3: Robust Pipeline Dispatch
@@ -192,10 +217,10 @@ class DocumentService:
                 logger.info(f"Running pipeline synchronously for document {document_id}")
                 for pid in pages_to_dispatch:
                     try:
-                        process_page_ocr_task(pid)
+                        process_page_ocr_task.delay(pid)
                     except Exception as e:
                         logger.error(f"OCR failed for page {pid}: {e}")
-                mark_document_ready_to_assign(document.id)
+                mark_document_ready_to_assign.delay(document.id)
             else:
                 from celery import chain, group
                 logger.info(f"Dispatching async pipeline for document {document_id}")
@@ -205,8 +230,13 @@ class DocumentService:
                 )
                 pipeline.apply_async()
             
-            logger.info(f"Pipeline processing initiated for document {document_id}")
+            logger.info(f"Pipeline processing initiated for document {document_id} with {total} pages.")
 
         except Exception as e:
-            Document.objects.filter(id=document_id).update(status=DocumentStatus.FAILED, pipeline_error=str(e))
+            logger.exception(f"Critical failure in split_document for {document_id}: {e}")
+            Document.objects.filter(id=document_id).update(
+                status=DocumentStatus.FAILED, 
+                pipeline_status=PipelineStatus.FAILED,
+                pipeline_error=f"Split Error: {str(e)}"
+            )
             raise e

@@ -38,10 +38,52 @@ def mark_inactive_resources():
 
     count = gone_offline.count()
     if count > 0:
+        # Before marking inactive, find their active assignments to revoke them
+        from apps.processing.models import PageAssignment
+        from common.enums import PageAssignmentStatus, PageStatus
+        
+        active_assignments = PageAssignment.objects.filter(
+            resource__in=gone_offline,
+            status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+        )
+        
+        revoked_count = 0
+        for assignment in active_assignments:
+            with transaction.atomic():
+                # 1. Update assignment
+                assignment.status = PageAssignmentStatus.REASSIGNED
+                assignment.save(update_fields=['status'])
+                
+                # 2. Reset page for next person or Escalate
+                page = assignment.page
+                
+                # MAX_REASSIGNMENTS = 3
+                if (assignment.reassignment_count or 0) >= 3:
+                    page.status = PageStatus.ESCALATED
+                    page.validation_errors = (page.validation_errors or []) + ["Max reassignment attempts reached (3). Resource went offline during last attempt."]
+                    logger.warning(f"Page {page.id} ESCALATED - resource went offline and max attempts reached.")
+                else:
+                    page.status = PageStatus.PENDING
+                
+                page.current_assignee = None
+                page.is_locked = False
+                page.save(update_fields=['status', 'current_assignee', 'is_locked', 'validation_errors'])
+                
+                # 3. Notify original resource (if they reappear briefly)
+                try:
+                    from apps.processing.consumers import send_timeout_notification
+                    send_timeout_notification(assignment.resource.user.id, page.page_number)
+                except: pass
+                
+                revoked_count += 1
+        
         gone_offline.update(status=ResourceStatus.INACTIVE, is_available=False)
-        logger.info(f"Marked {count} resources INACTIVE due to missed heartbeats (120s timeout).")
+        logger.info(f"Marked {count} resources INACTIVE. Revoked {revoked_count} active assignments.")
+        
+        if revoked_count > 0:
+            assign_pages_task.delay()
 
-    return {'marked_inactive': count}
+    return {'marked_inactive': count, 'revoked_assignments': revoked_count}
 
 
 # ── Section 2: Processing Time Limits ──────────────────────
@@ -76,12 +118,25 @@ def check_processing_timeouts():
                 assignment.processing_end_at = now
                 assignment.save()
                 
-                # 2. Update page status back to PENDING so it gets reassigned
-                assignment.page.status = PageStatus.PENDING
-                assignment.page.save()
+                # 2. Update page status and CLEAR locks
+                # Anti-Loop: Check reassignment count
+                page = assignment.page
+                
+                # MAX_REASSIGNMENTS = 3
+                if (assignment.reassignment_count or 0) >= 3:
+                    page.status = PageStatus.ESCALATED
+                    page.validation_errors = (page.validation_errors or []) + ["Max reassignment attempts reached (3). Likely problematic content."]
+                    logger.warning(f"Page {page.id} ESCALATED after 3 failed assignments.")
+                else:
+                    page.status = PageStatus.PENDING # Re-queue
+                
+                page.current_assignee = None
+                page.is_locked = False
+                page.save(update_fields=['status', 'current_assignee', 'is_locked', 'validation_errors'])
                 
                 # 3. Update Resource stats
                 prof = assignment.resource
+                from django.db.models import F
                 prof.rejection_count = F('rejection_count') + 1
                 prof.save(update_fields=['rejection_count'])
                 prof.refresh_status()
@@ -91,14 +146,20 @@ def check_processing_timeouts():
                 send_timeout_notification(assignment.resource.user.id, assignment.page.page_number)
                 
                 # 5. Audit Log for Timeout
+                from apps.audit.models import AuditLog
+                from common.enums import AuditEventType
                 AuditLog.objects.create(
-                    action=AuditEventType.TIMEOUT, # Correct enum
+                    action=AuditEventType.TIMEOUT,
                     assignment_id=assignment.id,
                     document_id=assignment.document.id,
                     actor=None,
                     old_status=PageAssignmentStatus.IN_PROGRESS,
                     new_status=PageAssignmentStatus.TIMED_OUT,
-                    metadata={'reason': 'SLA Expired', 'page_number': assignment.page.page_number}
+                    metadata={
+                        'reason': 'SLA Expired', 
+                        'page_number': page.page_number,
+                        'reassignment_count': assignment.reassignment_count
+                    }
                 )
                 
             timeouts_triggered += 1
@@ -162,21 +223,31 @@ def extract_page_blocks_task(self, page_id):
             Block.objects.filter(page=page).delete()
             PageTable.objects.filter(page=page).delete()
             
+            # Update page dimensions
+            page.pdf_page_width = layout.get('page_width', 0)
+            page.pdf_page_height = layout.get('page_height', 0)
+            page.blocks_extracted = True
+            page.save(update_fields=['pdf_page_width', 'pdf_page_height', 'blocks_extracted'])
+
             # Save blocks
             blocks_to_create = []
             for idx, blk in enumerate(layout['blocks']):
+                # Standard PDF bbox [x0, y0, x1, y1]
+                bbox = [blk['x'], blk['y'], blk['x'] + blk['width'], blk['y'] + blk['height']]
+                
                 blocks_to_create.append(Block(
                     page=page,
                     block_index=idx,
                     block_id=blk['block_id'],
                     block_type=blk['block_type'],
                     extracted_text=blk['text'],
-                    original_text=blk['text'],  # Keep as source of truth
+                    original_text=blk['text'],
                     current_text=blk['text'],
                     x=blk['x'],
                     y=blk['y'],
                     width=blk['width'],
                     height=blk['height'],
+                    bbox=bbox,  # Added this
                     font_name=blk['font_family'],
                     font_size=blk['font_size'],
                     font_weight=blk['font_weight'],
@@ -290,10 +361,10 @@ def mark_document_ready_to_assign(document_id):
         doc.status = DocumentStatus.READY
         doc.save(update_fields=['pipeline_status', 'status'])
         
-        # ✅ Add to Queue (Crucial for assignment engine)
+        # ✅ Add/Update Queue (Crucial for assignment engine)
         from apps.processing.models import DocumentQueue
         from common.enums import QueueStatus
-        DocumentQueue.objects.get_or_create(
+        DocumentQueue.objects.update_or_create(
             document=doc,
             defaults={'status': QueueStatus.WAITING}
         )
@@ -318,43 +389,7 @@ def validate_all_pages(document_id):
         pass
 
 
-# ── Section 8: File Conversion (Word to PDF) ───────────────
-@shared_task(bind=True, max_retries=3)
-def convert_word_to_pdf(self, document_id):
-    import subprocess
-    from django.core.files import File
-    from django.core.files.temp import NamedTemporaryFile
-    
-    try:
-        doc = Document.objects.get(id=document_id)
-        doc.pipeline_status = PipelineStatus.CONVERTING
-        doc.save(update_fields=['pipeline_status'])
-        
-        # Skip if already PDF
-        if doc.file.name.lower().endswith('.pdf'):
-            doc.pipeline_status = PipelineStatus.SPLITTING
-            doc.save(update_fields=['pipeline_status'])
-            # Trigger split
-            from apps.documents.tasks import process_document_task
-            process_document_task.delay(doc.id)
-            return
-            
-        # Very basic mock logic for LibreOffice conversion on server
-        # In actual prod, this hits unoconv or a microservice
-        # ...
-        
-        # For now, just mark it ready to split to keep pipeline flowing
-        # (Assuming the system ensures file uploaded is PDF for this iteration)
-        doc.pipeline_status = PipelineStatus.SPLITTING
-        doc.save(update_fields=['pipeline_status'])
-        from apps.documents.tasks import process_document_task
-        process_document_task.delay(doc.id)
-        
-    except Exception as exc:
-        doc.pipeline_status = PipelineStatus.FAILED
-        doc.pipeline_error = f"Conversion failed: {str(exc)}"
-        doc.save()
-        raise self.retry(exc=exc, countdown=60)
+# Redundant convert_word_to_pdf removed. Use apps.documents.tasks.convert_word_to_pdf instead.
 
 
 # ── Section 10: Merge Document ─────────────────────────────
@@ -459,9 +494,8 @@ def resplit_missing_pages(document_id):
         
         pdf.close()
         
-        # Restart pipeline for fixed pages
+        # Restart pipeline for fixed pages (OCR -> Extract -> Validate)
         for pid in new_page_ids:
-            # Chain: OCR -> Extract -> Validate
-            extract_page_blocks_task.delay(pid)
+            process_page_ocr_task.delay(pid)
             
         return f"Repaired {len(new_page_ids)} pages for document {document_id}"

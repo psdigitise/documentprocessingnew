@@ -29,47 +29,78 @@ class PDFBakeService:
             doc = fitz.open(stream=source_pdf.read(), filetype="pdf")
             
             # Determine which page in the PDF we are targeting
-            # If it's already a single-page split PDF, then it's index 0
-            # If it's the original full document, it's page_number - 1
-            if page.content_file and 'assignments/' in page.content_file.name:
-                pdf_page = doc[0]
-            else:
-                pdf_page = doc[page.page_number - 1]
-
-            blocks = page.blocks.all()
+            page_index = 0
+            if len(doc) > 1:
+                page_index = page.page_number - 1
+                if page_index < 0 or page_index >= len(doc):
+                    page_index = 0
             
-            # Pass 1: Redact original blocks
-            for block in blocks:
-                bbox = block.bbox
-                # fitz.Rect expects [x0, y0, x1, y1]
-                pdf_page.add_redact_annot(fitz.Rect(bbox), fill=(1,1,1))
-            
-            pdf_page.apply_redactions()
+            source_page = doc[page_index]
+            page_rect = source_page.rect
+            doc.close()
 
-            # Pass 2: Insert User Text
-            for block in blocks:
-                text = block.current_text # This is the user's latest edit
-                if not text: 
-                    text = block.extracted_text
+            # 2. Create a NEW BLANK PDF for pure reconstruction
+            # "The final PDF should not use the originally uploaded PDF. 
+            # It must be generated only from the edited and submitted blocks."
+            new_doc = fitz.open()
+            pdf_page = new_doc.new_page(width=page_rect.width, height=page_rect.height)
+
+            # 3. Extract elements to bake (prefer HTML text_content if available)
+            elements = []
+            if page.text_content:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(page.text_content, 'html.parser')
+                # Find all span and td tags with bboxes (standard for our workspace)
+                html_elements = soup.find_all(['span', 'td'], attrs={'data-bbox': True})
+                for el in html_elements:
+                    try:
+                        bbox_str = el['data-bbox'].replace('(', '[').replace(')', ']')
+                        bbox = json.loads(bbox_str)
+                        if not bbox: continue
+                        
+                        text = el.get_text().strip()
+                        # Default font info
+                        font_size = 10.0
+                        import re
+                        style = el.get('style', '')
+                        fs_match = re.search(r'font-size:\s*([\d\.]+)', style)
+                        if fs_match:
+                            font_size = float(fs_match.group(1))
+
+                        elements.append({
+                            'bbox': bbox,
+                            'text': text,
+                            'font_size': font_size
+                        })
+                    except: continue
+
+            # Fallback to Block model if HTML is empty
+            if not elements:
+                for block in page.blocks.all():
+                    elements.append({
+                        'bbox': block.bbox,
+                        'text': block.current_text or block.extracted_text,
+                        'font_size': block.font_size or 10.0
+                    })
+
+            # 4. Insert User Text onto the BLANK page
+            for el in elements:
+                if not el['text']: continue
                 
-                if not text: continue
-                
-                bbox = block.bbox
-                # Use fitz's textbox for precision
-                # Note: PyMuPDF coords are 72 DPI (Points)
+                # Use insert_textbox to place the text precisely where it was in the workspace
                 pdf_page.insert_textbox(
-                    fitz.Rect(bbox),
-                    text,
-                    fontsize=block.font_size,
-                    fontname="helv", # Default to helvetica if unknown
-                    color=(0, 0, 0), # Primary black
-                    align=0 # left
+                    fitz.Rect(el['bbox']),
+                    el['text'],
+                    fontsize=el['font_size'],
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    align=0
                 )
 
-            # 3. Save to buffer
+            # 5. Save to buffer
             result_buffer = BytesIO()
-            doc.save(result_buffer)
-            doc.close()
+            new_doc.save(result_buffer)
+            new_doc.close()
 
             return result_buffer.getvalue()
         except Exception as e:

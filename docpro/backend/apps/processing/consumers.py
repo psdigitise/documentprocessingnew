@@ -85,12 +85,26 @@ class WorkspaceConsumer(AsyncWebsocketConsumer):
             # Extract individual page blocks (<div class="editor-page" data-page-id="...">)
             page_blocks = soup.find_all('div', class_='editor-page')
             
+            is_admin = self.user.role == UserRole.ADMIN or self.user.is_superuser or self.user.is_staff
+            from apps.processing.models import PageAssignment
+            from common.enums import PageAssignmentStatus
+            
             for block in page_blocks:
                 p_id = block.get('data-page-id')
                 if not p_id: continue
                 
+                # Security Check: Resource must have an active assignment for this page
+                if not is_admin:
+                    has_permission = PageAssignment.objects.filter(
+                        page_id=p_id,
+                        resource__user=self.user,
+                        status__in=[PageAssignmentStatus.ASSIGNED, PageAssignmentStatus.IN_PROGRESS]
+                    ).exists()
+                    if not has_permission:
+                        logger.warning(f"User {self.user.username} attempted to bulk-save unassigned/inactive page {p_id}. Skipping.")
+                        continue
+
                 # Update the specific page text content
-                # We normalize the content of the block to just its children to save clean HTML
                 Page.objects.filter(
                     id=p_id,
                     document__doc_ref=self.doc_ref

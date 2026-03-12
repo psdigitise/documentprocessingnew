@@ -1,14 +1,19 @@
+import logging
 import fitz  # PyMuPDF
 from apps.documents.models import Page
 from common.enums import ComplexityType
 
+logger = logging.getLogger(__name__)
+
 class ComplexityResult:
-    def __init__(self, complexity, weight, table_count, image_count, word_count):
+    def __init__(self, complexity, weight, table_count, image_count, word_count, block_density=0, image_density=0):
         self.complexity = complexity
         self.weight = weight
         self.table_count = table_count
         self.image_count = image_count
         self.word_count = word_count
+        self.block_density = block_density
+        self.image_density = image_density
 
 class ComplexityScorer:
     """
@@ -39,18 +44,35 @@ class ComplexityScorer:
             word_count = len(words) if words else 0
             
             block_density = 0
+            image_density = 0
+            page_area = fitz_page.rect.width * fitz_page.rect.height
+            
             if fitz_page.rect.height > 0 and text_blocks:
                 block_density = len(text_blocks) / fitz_page.rect.height
+            
+            if page_area > 0 and images:
+                # Approximate image density based on count vs page area
+                image_density = (image_count * 10000) / page_area
+
+            # File size factor
+            file_size_kb = 0
+            if page.content_file:
+                file_size_kb = page.content_file.size / 1024
 
             doc.close()
 
-            # Heavy logic
-            if table_count >= 2 or (table_count == 1 and word_count > 200):
+            # Enhanced Scoring Logic (Senior dev approach)
+            # Thresholds: Tables are highest priority, then dense text/images
+            if table_count >= 2 or (table_count == 1 and word_count > 500) or file_size_kb > 4096:
                 complexity = ComplexityType.TABLE_HEAVY
-                weight = 3.5
-            elif table_count == 1 or image_count > 2 or block_density > 0.05:
+                weight = 5.0  # Increased from 3.5 for better spread
+            elif table_count == 1 or image_density > 2.0 or block_density > 0.08 or word_count > 1000:
                 complexity = ComplexityType.COMPLEX
-                weight = 2.0
+                weight = 2.5
+            elif word_count > 300 or image_count > 0 or block_density > 0.03:
+                complexity = ComplexityType.SIMPLE # Still SIMPLE but with higher base weight? 
+                # Actually stick to the enums but adjust weights
+                weight = 1.2
             else:
                 complexity = ComplexityType.SIMPLE
                 weight = 1.0
@@ -60,7 +82,9 @@ class ComplexityScorer:
                 weight=weight,
                 table_count=table_count, 
                 image_count=image_count,
-                word_count=word_count
+                word_count=word_count,
+                block_density=block_density,
+                image_density=image_density
             )
             
         except Exception as e:
@@ -78,11 +102,14 @@ class ComplexityScorer:
         page.table_count = result.table_count
         page.image_count = result.image_count
         page.word_count = result.word_count
+        page.block_density = result.block_density
+        page.image_density = result.image_density
         
         from django.utils import timezone
         page.complexity_scored_at = timezone.now()
         page.save(update_fields=[
             'complexity_type', 'complexity_weight', 'complexity_score',
-            'table_count', 'image_count', 'word_count', 'complexity_scored_at'
+            'table_count', 'image_count', 'word_count', 
+            'block_density', 'image_density', 'complexity_scored_at'
         ])
         return result

@@ -264,6 +264,8 @@ class Page(models.Model):
     word_count = models.IntegerField(default=0)
     table_count = models.IntegerField(default=0)
     image_count = models.IntegerField(default=0)
+    block_density = models.FloatField(default=0.0)
+    image_density = models.FloatField(default=0.0)
     
     validation_status = models.CharField(
         max_length=30,
@@ -279,6 +281,7 @@ class Page(models.Model):
     blocks_extracted = models.BooleanField(default=False)
     blocks_count = models.IntegerField(default=0)
     has_tables = models.BooleanField(default=False)
+    split_error = models.TextField(blank=True, default='', help_text=_("Errors encountered during PDF splitting"))
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -75,9 +75,13 @@ def check_all_pages_submitted(sender, instance, created, **kwargs):
     if created:
         doc = instance.document
         total_pages = doc.total_pages
-        submitted_pages = doc.submitted_pages.count()
+        # Count UNIQUE pages that have at least one PENDING_REVIEW or APPROVED submission
+        from common.enums import ReviewStatus
+        active_submitted_pages = doc.submitted_pages.filter(
+            review_status__in=[ReviewStatus.PENDING_REVIEW, ReviewStatus.APPROVED]
+        ).values('page_number').distinct().count()
         
-        if submitted_pages == total_pages and total_pages > 0:
+        if active_submitted_pages == total_pages and total_pages > 0:
             if doc.pipeline_status == PipelineStatus.IN_PROGRESS:
                 doc.pipeline_status = PipelineStatus.ALL_SUBMITTED
                 doc.save(update_fields=['pipeline_status'])
@@ -101,12 +105,16 @@ def check_all_pages_approved(sender, instance, **kwargs):
     if instance.review_status == ReviewStatus.APPROVED:
         doc = instance.document
         total_pages = doc.total_pages
-        approved_pages = doc.submitted_pages.filter(review_status=ReviewStatus.APPROVED).count()
+        # Count unique pages that reached APPROVED status
+        approved_pages_count = doc.submitted_pages.filter(
+            review_status=ReviewStatus.APPROVED
+        ).values('page_number').distinct().count()
         
-        if approved_pages == total_pages and total_pages > 0:
-             # Prevent double triggering
-            if not getattr(doc, '_merge_triggered', False):
-                setattr(doc, '_merge_triggered', True)
+        if approved_pages_count == total_pages and total_pages > 0:
+             # Prevent double triggering by checking pipeline status
+            if doc.pipeline_status not in [PipelineStatus.MERGING, PipelineStatus.MERGED]:
+                doc.pipeline_status = PipelineStatus.MERGING
+                doc.save(update_fields=['pipeline_status'])
                 
                 from apps.processing.tasks import merge_document_pages
                 

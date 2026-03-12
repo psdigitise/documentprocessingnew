@@ -1,3 +1,4 @@
+import os
 import logging
 import json
 import itertools
@@ -41,7 +42,7 @@ class AssignmentService:
         return ResourceProfile.objects.filter(
             status=ResourceStatus.ACTIVE,
             is_available=True,
-            last_active_at__gte=presence_threshold
+            last_seen__gte=online_threshold
         ).annotate(
             # Compute load directly in SQL
             computed_load=Coalesce(
@@ -72,11 +73,9 @@ class AssignmentService:
         """
         Calculate how many pages this resource can accept
         based on their remaining capacity and page weights.
-        If 'current_load' is provided, uses it (useful for batch cycles).
-        Otherwise always re-fetches current load from DB (not cached).
+        Implements a greedy weighted fit (Section 5).
         """
         if current_load is None:
-            # ✅ Only fetch if not provided (fallback)
             resource.refresh_from_db()
             current_load = resource.current_load
 
@@ -84,29 +83,67 @@ class AssignmentService:
         if remaining_capacity <= 0:
             return []
 
+        # Sort available pages by weight DESCENDING (Greedy approach)
+        # to ensure complex pages are handled first and balanced across resources.
+        sorted_pages = sorted(
+            available_pages, 
+            key=lambda p: p.complexity_weight or 1.0, 
+            reverse=True
+        )
+
         allocated    = []
         total_weight = 0.0
 
-        for page in available_pages:
-            # ✅ Guard against NULL weight
-            page_weight = page.complexity_weight
-            if page_weight is None or page_weight <= 0:
-                page_weight = 1.0  # safe default
-                # Also fix in DB
-                Page.objects.filter(pk=page.pk).update(
-                    complexity_weight=1.0
-                )
-
+        for page in sorted_pages:
+            page_weight = page.complexity_weight or 1.0
+            
             if total_weight + page_weight <= min(
                 AssignmentService.TARGET_BLOCK_WEIGHT,
                 remaining_capacity
             ):
                 allocated.append(page)
                 total_weight += page_weight
-            else:
+            
+            # If we hit capacity, we stop trying to fit more in this cycle
+            if total_weight >= min(AssignmentService.TARGET_BLOCK_WEIGHT, remaining_capacity):
                 break
 
         return allocated
+
+    @staticmethod
+    def validate_document_integrity(document):
+        """
+        Technical Integrity Check: Compare stored Page count against original PDF metadata.
+        Ensures strict sequential order and file existence.
+        """
+        from apps.documents.models import Page
+        from common.enums import DocumentStatus, PipelineStatus
+        
+        expected_count = document.total_pages
+        actual_pages = Page.objects.filter(document=document).order_by('page_number')
+        actual_count = actual_pages.count()
+
+        if expected_count is not None and actual_count != expected_count:
+            error_msg = f"Integrity Breach: Expected {expected_count} pages, found {actual_count}."
+            document.status = DocumentStatus.FAILED
+            document.pipeline_status = PipelineStatus.FAILED
+            document.pipeline_error = error_msg
+            document.save()
+            logger.error(f"Integrity check failed for {document.id}: {error_msg}")
+            return False, error_msg
+
+        # Check for sequence gaps and file presence
+        for idx, page in enumerate(actual_pages):
+            expected_num = idx + 1
+            if page.page_number != expected_num:
+                error_msg = f"Integrity Breach: Sequence gap at page {expected_num}. Found {page.page_number}."
+                return False, error_msg
+            
+            if not page.content_file or not os.path.exists(page.content_file.path):
+                error_msg = f"Integrity Breach: Missing file for page {page.page_number}."
+                return False, error_msg
+
+        return True, "Integrity verified."
 
     @staticmethod
     def _broadcast_resource_update(resource):
@@ -184,12 +221,28 @@ class AssignmentService:
             if page.status in [PageStatus.ASSIGNED, PageStatus.IN_PROGRESS]:
                 continue  # skip already-assigned pages silently
 
+            # ── REASSIGNMENT LOGIC (Anti-Loop) ─────────────────
+            # Find the most recent terminal assignment for this page to inherit count
+            last_asgn = PageAssignment.objects.filter(page=page).order_by('-assigned_at').first()
+            
+            re_count = 0
+            is_re = False
+            prev_asgn = None
+            
+            if last_asgn:
+                re_count = (last_asgn.reassignment_count or 0) + 1
+                is_re = True
+                prev_asgn = last_asgn
+
             assignment = PageAssignment.objects.create(
                 page=page,
                 resource=resource,
                 document=page.document,
                 status=PageAssignmentStatus.ASSIGNED,
-                max_processing_time=int(600 * (page.complexity_weight or 1.0)),
+                max_processing_time=600,  # ✅ Fixed to 10 minutes (600s) as requested
+                reassignment_count=re_count,
+                is_reassigned=is_re,
+                reassigned_from=prev_asgn
             )
             page.status = PageStatus.ASSIGNED
             page.current_assignee = resource.user
@@ -198,14 +251,16 @@ class AssignmentService:
             
             # Audit
             AuditLog.objects.create(
-                action=AuditEventType.ASSIGNED,
+                action=AuditEventType.ASSIGNED if not is_re else AuditEventType.REASSIGNED,
                 assignment_id=assignment.id,
                 document_id=page.document.id,
                 actor=None,
                 metadata={
                     'resource_id': resource.id, 
                     'page_number': page.page_number,
-                    'is_reassignment': False
+                    'is_reassignment': is_re,
+                    'reassignment_count': re_count,
+                    'previous_assignment_id': prev_asgn.id if prev_asgn else None
                 }
             )
             assignments.append(assignment)
@@ -233,7 +288,10 @@ class AssignmentService:
             if document_id:
                 queue_items = query.filter(document_id=document_id)
             else:
-                queue_items = query.filter(status=QueueStatus.WAITING).order_by('position', 'created_at')
+                # Include ASSIGNED documents in case they have newly pending pages (e.g. from re-splitting)
+                queue_items = query.filter(
+                    status__in=[QueueStatus.WAITING, QueueStatus.ASSIGNED]
+                ).order_by('position', 'created_at')
 
             total_assigned = 0
             
@@ -257,12 +315,21 @@ class AssignmentService:
                 logger.info("No active resources available for assignment.")
                 return 0
 
-            # Maintain in-memory load mapping to prevent over-assignment during same transaction
-            resource_loads = {r.id: r.current_load for r in resources}
-            updated_resources = set()
+            # Global Page Pool: Collect ALL eligible pages from ALL docs in queue
+            # to ensure we balance complexity across the entire workforce.
+            global_page_pool = []
+            doc_exclusion_map = {} # doc_id -> exclusion_map (page_id -> set(resource_ids))
+
             for item in queue_items:
                 doc = item.document
                 
+                # ✅ Anti-Skip: Verify Technical Integrity BEFORE assignment
+                is_valid, integrity_msg = AssignmentService.validate_document_integrity(doc)
+                if not is_valid:
+                    item.status = QueueStatus.FAILED
+                    item.save()
+                    continue
+
                 # Pre-fetch all past failed assignments and manual exclusions for this document
                 from apps.processing.models import RejectedPage
                 doc_exclusions = {} # page_id -> set(resource_ids)
@@ -288,70 +355,126 @@ class AssignmentService:
                     pid, rid = me['page_id'], me['excluded_resources__id']
                     if rid:
                         doc_exclusions.setdefault(pid, set()).add(rid)
-
-                # Fetch pending pages
-                pending_pages = Page.objects.filter(
-                    document=doc,
-                    status__in=[PageStatus.PENDING, PageStatus.FAILED]
-                ).order_by('page_number')
                 
-                if not pending_pages.exists():
+                doc_exclusion_map[doc.id] = doc_exclusions
+
+                # ✅ Recovery: Clear stale locks for PENDING/FAILED pages
+                # If a page is PENDING but is_locked=True, it's a stale lock from a crashed cycle.
+                Page.objects.filter(
+                    document=doc,
+                    status__in=[PageStatus.PENDING, PageStatus.FAILED],
+                    is_locked=True
+                ).update(is_locked=False)
+
+                # Fetch pending pages - STRICTLY filter for 'PENDING' or 'FAILED' (Unassigned)
+                # ✅ Locked during fetch to prevent concurrent assignment threads from seeing the same pool.
+                pending_pages = list(Page.objects.filter(
+                    document=doc,
+                    status__in=[PageStatus.PENDING, PageStatus.FAILED],
+                    is_locked=False
+                ).select_for_update(skip_locked=True).order_by('page_number'))
+                
+                if not pending_pages:
                     logger.info(f"Document {doc.id} ({doc.title}) has no pending pages. Marking queue ASSIGNED.")
                     item.status = QueueStatus.ASSIGNED
                     item.save(update_fields=['status'])
                     continue
 
-                # Attempt to assign pages to each resource
-                pages_list = list(pending_pages)
-                assigned_in_cycle = set() # Track pages assigned in this transaction cycle
-                
-                logger.info(f"Processing Document {doc.id} ({doc.title}) with {len(pages_list)} pending pages.")
-                
-                for res in resources:
-                    # Filter pages that this resource can take (not already assigned in this cycle AND not excluded)
-                    eligible_pages = [
-                        p for p in pages_list 
-                        if p.id not in assigned_in_cycle 
-                        and res.id not in doc_exclusions.get(p.id, set())
-                    ]
-                    
-                    if not eligible_pages:
-                        continue
-                    
-                    # Calculate how many pages this resource can take using IN-MEMORY load
-                    to_assign = AssignmentService.calculate_pages_for_resource(
-                        res, eligible_pages, current_load=resource_loads.get(res.id)
-                    )
-                    
-                    if to_assign:
-                        page_ids = [p.pk for p in to_assign]
-                        try:
-                            # Use a sub-transaction point for each assignment attempt
-                            with transaction.atomic():
-                                AssignmentService.assign_pages_to_resource(page_ids, res, broadcast=False)
-                                
-                                # Update in-memory load for next doc/page
-                                block_weight = sum(float(p.complexity_weight or 1.0) for p in to_assign)
-                                resource_loads[res.id] += block_weight
-                                
-                                # Mark as assigned in this cycle
-                                for p in to_assign:
-                                    assigned_in_cycle.add(p.id)
-                                    
-                                total_assigned += len(to_assign)
-                        except Exception as e:
-                            logger.error(f"Failed to assign pages {page_ids} to resource {res.id}: {e}")
-                            continue
+                global_page_pool.extend(pending_pages)
 
-                # If all pages of this doc were assigned in this cycle, mark queue item complete
-                if len(assigned_in_cycle) >= len(pages_list):
-                    item.status = QueueStatus.ASSIGNED
-                    item.save(update_fields=['status'])
-                    doc.pipeline_status = PipelineStatus.IN_PROGRESS
-                    doc.save(update_fields=['pipeline_status'])
-                    logger.info(f"Document {doc.title} fully assigned and moved to IN_PROGRESS.")
-                else:
-                    logger.info(f"Document {doc.title} partially assigned. {len(pages_list) - len(assigned_in_cycle)} pages remaining.")
+            if not global_page_pool:
+                return 0
+
+            # ── BLOCK-BASED SEQUENTIAL ASSIGNMENT ───────────────────
+            # Sort resources by current load (balance existing work)
+            resources.sort(key=lambda r: r.computed_load)
+            resource_loads = {r.id: r.computed_load for r in resources}
+            updated_resources = set()
+
+            for item in queue_items:
+                doc = item.document
+                # Get pending pages for this doc in sequential order
+                doc_pages = sorted([p for p in global_page_pool if p.document_id == doc.id], key=lambda x: x.page_number)
+                if not doc_pages: continue
+
+                # Iterate through pages and group into blocks
+                idx = 0
+                while idx < len(doc_pages):
+                    # Filter resources that have at least some capacity left
+                    eligible_res = [
+                        res for res in resources 
+                        if resource_loads[res.id] < res.max_capacity
+                    ]
+                    if not eligible_res:
+                        logger.warning(f"No capacity left for doc {doc.title} at page {doc_pages[idx].page_number}")
+                        break
+                    
+                    # Sort candidates by lowest load
+                    eligible_res.sort(key=lambda r: resource_loads[r.id])
+                    
+                    picked_res = None
+                    block_pages = []
+                    block_weight = 0
+
+                    for res in eligible_res:
+                        # Test if this resource can take at least the current page
+                        p = doc_pages[idx]
+                        w = p.complexity_weight or 1.0
+                        exclusions = doc_exclusion_map.get(doc.id, {}).get(p.id, set())
+                        
+                        if res.id not in exclusions and (resource_loads[res.id] + w <= res.max_capacity):
+                            picked_res = res
+                            # Fill the block sequentially for THIS resource
+                            while idx < len(doc_pages):
+                                curr_p = doc_pages[idx]
+                                curr_w = curr_p.complexity_weight or 1.0
+                                curr_excl = doc_exclusion_map.get(doc.id, {}).get(curr_p.id, set())
+                                
+                                # Conditions to stop filling this block:
+                                # 1. Resource hit capacity
+                                # 2. Resource is excluded from this specific page
+                                # 3. Block weight target exceeded (Section 11)
+                                if res.id in curr_excl or (resource_loads[res.id] + block_weight + curr_w > res.max_capacity):
+                                    break
+                                
+                                if block_pages and (block_weight + curr_w > AssignmentService.TARGET_BLOCK_WEIGHT):
+                                    break
+                                
+                                block_pages.append(curr_p)
+                                block_weight += curr_w
+                                idx += 1
+                            break # Picked the resource and filled as much as possible
+
+                    if picked_res and block_pages:
+                        try:
+                            with transaction.atomic():
+                                p_ids = [bp.id for bp in block_pages]
+                                AssignmentService.assign_pages_to_resource(p_ids, picked_res, broadcast=False)
+                                
+                                resource_loads[picked_res.id] += block_weight
+                                updated_resources.add(picked_res)
+                                total_assigned += len(block_pages)
+                        except Exception as e:
+                            logger.error(f"Failed to assign block to res {picked_res.id}: {e}")
+                            idx += 1 # Avoid infinite loop
+                    else:
+                        # Current page doc_pages[idx] cannot be assigned to ANY available resource
+                        logger.warning(f"Page {doc_pages[idx].page_number} (doc {doc.id}) has no eligible resources.")
+                        idx += 1
+
+            # Check if documents in queue are now fully assigned
+            for item in queue_items:
+                doc = item.document
+                if item.status == QueueStatus.WAITING:
+                    still_pending = Page.objects.filter(
+                        document=doc, status__in=[PageStatus.PENDING, PageStatus.FAILED]
+                    ).exists()
+                    if not still_pending:
+                        item.status = QueueStatus.ASSIGNED
+                        item.save(update_fields=['status'])
+                        doc.pipeline_status = PipelineStatus.IN_PROGRESS
+                        doc.save(update_fields=['pipeline_status'])
+                        logger.info(f"Document {doc.title} fully assigned.")
             
             # Bulk broadcast for all updated resources
             for res in updated_resources:
@@ -381,7 +504,8 @@ class AssignmentService:
 
             page.status = PageStatus.PENDING
             page.current_assignee = None
-            page.save()
+            page.is_locked = False
+            page.save(update_fields=['status', 'current_assignee', 'is_locked'])
 
             if not auto_assign:
                 return None
@@ -456,7 +580,7 @@ class AssignmentService:
                 is_reassigned=True,
                 reassignment_count=old_assignment.reassignment_count + 1,
                 reassigned_from=old_assignment,
-                max_processing_time=int(600 * getattr(page, 'complexity_weight', 1.0))
+                max_processing_time=600  # ✅ Fixed to 10 minutes (600s) as requested
             )
             
             # Update page back to ASSIGNED with new user
@@ -544,59 +668,11 @@ class ProcessingService:
             )
 
             try:
-                import fitz
-                from io import BytesIO
-                import os
-                
-                if assignment.document.file and os.path.exists(assignment.document.file.path):
-                    # Generate snapshot PDF of this single page for admin review
-                    doc = fitz.open(assignment.document.file.path)
-                    pdf_page_idx = page.page_number - 1
-                    if 0 <= pdf_page_idx < len(doc):
-                        pdf_page = doc[pdf_page_idx]
-                        
-                        if page.text_content:
-                            from bs4 import BeautifulSoup
-                            soup = BeautifulSoup(page.text_content, 'html.parser')
-                            # Find all span and td tags with bboxes
-                            elements = soup.find_all(['span', 'td'], attrs={'data-bbox': True})
-                            
-                            # Pass 1: Redact
-                            for el in elements:
-                                try:
-                                    bbox = json.loads(el['data-bbox'].replace('(', '[').replace(')', ']'))
-                                    if not bbox: continue
-                                    pdf_page.add_redact_annot(fitz.Rect(bbox), fill=(1,1,1))
-                                except: continue
-                            pdf_page.apply_redactions()
-                            
-                            # Pass 2: Insert
-                            for el in elements:
-                                try:
-                                    bbox = json.loads(el['data-bbox'].replace('(', '[').replace(')', ']'))
-                                    if not bbox: continue
-                                    text_val = el.get_text().strip()
-                                    if text_val:
-                                        pdf_page.insert_textbox(
-                                            fitz.Rect(bbox), 
-                                            text_val,
-                                            fontsize=10,
-                                            fontname="helv",
-                                            align=0
-                                        )
-                                except: continue
-                        
-                        result_buffer = BytesIO()
-                        
-                        # Create a new 1-page PDF
-                        single_page_doc = fitz.open()
-                        single_page_doc.insert_pdf(doc, from_page=pdf_page_idx, to_page=pdf_page_idx)
-                        single_page_doc.save(result_buffer)
-                        single_page_doc.close()
-                        doc.close()
-                        
-                        filename = f"submitted_page_{page.page_number}_{assignment.id}.pdf"
-                        submission.output_page_file.save(filename, ContentFile(result_buffer.getvalue()), save=True)
+                # Use centralized baking service to generate the submitted page PDF
+                from apps.processing.services.pdf_baking import PDFBakeService
+                baked_content = PDFBakeService.bake_page_edits(page)
+                filename = f"submitted_page_{page.page_number}_{assignment.id}.pdf"
+                submission.output_page_file.save(filename, ContentFile(baked_content), save=True)
             except Exception as pdf_err:
                 logger.error(f"Error generating submitted page PDF snapshot: {pdf_err}")
 
