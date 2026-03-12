@@ -61,16 +61,22 @@ class MergeService:
                         # This shouldn't happen due to the count check above, but for belt-and-suspenders:
                         raise ValueError(f"Integrity Error: Approved submission for page {page_num} went missing during merge.")
                     
-                    if not submission.output_page_file:
-                        logger.warning(f"Page {page_num} has no output_page_file. Attempting to bake now.")
-                        from apps.processing.services.pdf_baking import PDFBakeService
+                    # Always re-bake from the current page data during merge.
+                    # This ensures any fix to the baking service is picked up,
+                    # and avoids relying on a potentially stale output_page_file
+                    # that may have been baked with older (buggy) code.
+                    from apps.processing.services.pdf_baking import PDFBakeService
+                    try:
                         baked_content = PDFBakeService.bake_page_edits(submission.page)
-                        filename = f"on_the_fly_p{page_num}_{submission.id}.pdf"
-                        submission.output_page_file.save(filename, ContentFile(baked_content))
-                    
-                    # Open the baked submitted page and append to the final PDF
-                    # Using .open() instead of .path for durability across environments
-                    with fitz.open(stream=submission.output_page_file.read(), filetype="pdf") as page_pdf:
+                    except Exception as bake_err:
+                        logger.error(f"Re-bake failed for page {page_num} during merge: {bake_err}")
+                        # Fall back to stored file if re-bake fails
+                        if not submission.output_page_file:
+                            raise ValueError(f"No baked content for page {page_num} and re-bake also failed.")
+                        submission.output_page_file.seek(0)
+                        baked_content = submission.output_page_file.read()
+
+                    with fitz.open(stream=baked_content, filetype="pdf") as page_pdf:
                         doc_pdf.insert_pdf(page_pdf)
                         
                 # 4. Save to buffer
