@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'apps.documents',
     'apps.processing',
     'apps.audit',
+    'documents',
 ]
 
 MIDDLEWARE = [
