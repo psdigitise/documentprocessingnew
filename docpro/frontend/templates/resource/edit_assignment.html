@@ -535,10 +535,11 @@
      * text blocks and structural tables on the workspace.
      */
     class BlockLayoutRenderer {
-        constructor(pageId, containerId) {
+        constructor(pageId, containerId, isReadonly) {
             this.pageId = pageId;
             this.container = document.getElementById(containerId);
             this.interactiveLayer = this.container.querySelector('.interactive-layer');
+            this.isReadonly = isReadonly;
             this.pageWidth = 0;
             this.pageHeight = 0;
             this.blocks = [];
@@ -574,7 +575,7 @@
             span.className = 'text-block-editable';
             span.id = `block-${block.id}`;
             span.dataset.id = block.id;
-            span.contentEditable = "{{ is_readonly }}" !== "True";
+            span.contentEditable = !this.isReadonly;
             
             // Map CSS coordinates from API
             const css = block.css;
@@ -590,9 +591,11 @@
             if (block.font_style === 'italic') span.style.fontStyle = 'italic';
             // span.style.color = block.font_color || '#000000'; // Removed to allow CSS transparency
 
-            // Text content
             span.innerText = block.current_text || block.original_text || "";
             if (block.is_dirty) span.classList.add('has-edit');
+            
+            // Critical: Store original BBOX for merging
+            span.setAttribute('data-original-bbox', JSON.stringify(block.bbox));
 
             // Events
             span.addEventListener('input', () => this.handleInput(block.id, span.innerText));
@@ -622,7 +625,7 @@
                 row.forEach((cell, cIdx) => {
                     const td = document.createElement('td');
                     td.innerText = cell;
-                    td.contentEditable = "{{ is_readonly }}" !== "True";
+                    td.contentEditable = !this.isReadonly;
                     
                     // Link to cell save if needed
                     td.addEventListener('blur', () => this.saveTableCell(table.table_ref, rIdx, cIdx, td.innerText));
@@ -688,7 +691,7 @@
             
             workspace.innerHTML = ''; // Clear loading
 
-            // Process each assigned page
+            // 1. Process each assigned page in order
             for (const pageData of data.pages) {
                 const pageId = pageData.id;
                 
@@ -698,38 +701,60 @@
                 pageDiv.id = `page-container-${pageId}`;
                 workspace.appendChild(pageDiv);
 
-                // PDF Layer
-                const canvas = document.createElement('canvas');
+                // Create Layers
+                const canvas = document.createElement('canvas'); // PDF Background
                 canvas.className = 'pdf-canvas-layer';
                 pageDiv.appendChild(canvas);
 
-                // Interactive Layer
-                const interactiveLayer = document.createElement('div');
+                const interactiveLayer = document.createElement('div'); // Interactive blocks
                 interactiveLayer.className = 'interactive-layer';
+                interactiveLayer.setAttribute('data-page-id', pageId);
                 pageDiv.appendChild(interactiveLayer);
 
-                // 1. Render PDF background
-                const loadingTask = pdfjsLib.getDocument("{{ assignment.document.file.url }}" || "{{ pdf_url }}");
-                const pdf = await loadingTask.promise;
-                const pdfPage = await pdf.getPage(pageData.page_number);
-                
-                const cssWidth = 850; // Standard workspace width
-                const viewport = pdfPage.getViewport({ scale: cssWidth / pdfPage.view[2] });
-                const cssHeight = viewport.height;
+                // 2. Render PDF background (Using split page PDF for accuracy)
+                try {
+                    const sourceUrl = pageData.image_url || "{{ pdf_url }}";
+                    const loadingTask = pdfjsLib.getDocument(sourceUrl);
+                    const pdfDoc = await loadingTask.promise;
+                    
+                    // If it's a split page, always use index 1. 
+                    // If it's the full document fallback, use page_number.
+                    const pIndex = pdfDoc.numPages === 1 ? 1 : pageData.page_number;
+                    const pdfPage = await pdfDoc.getPage(pIndex);
+                    
+                    const cssWidth = 850; 
+                    const viewport = pdfPage.getViewport({ scale: cssWidth / pdfPage.view[2] });
+                    const cssHeight = viewport.height;
 
-                pageDiv.style.width = cssWidth + 'px';
-                pageDiv.style.height = cssHeight + 'px';
-                canvas.width = cssWidth;
-                canvas.height = cssHeight;
+                    pageDiv.style.width = cssWidth + 'px';
+                    pageDiv.style.height = cssHeight + 'px';
+                    canvas.width = cssWidth;
+                    canvas.height = cssHeight;
 
-                await pdfPage.render({
-                    canvasContext: canvas.getContext('2d'),
-                    viewport: viewport
-                }).promise;
+                    await pdfPage.render({
+                        canvasContext: canvas.getContext('2d'),
+                        viewport: viewport
+                    }).promise;
 
-                // 2. Clear loader and trigger Renderer
-                const renderer = new BlockLayoutRenderer(pageId, pageDiv.id);
-                await renderer.render(cssWidth, cssHeight);
+                    // 3. Trigger Block Layout rendering
+                    const renderer = new BlockLayoutRenderer(pageId, pageDiv.id, pageData.is_readonly);
+                    await renderer.render(cssWidth, cssHeight);
+                } catch (pageErr) {
+                    console.error(`Failed to render page ${pageData.page_number}:`, pageErr);
+                    pageDiv.innerHTML += `<div class="alert alert-warning" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);">Failed to load PDF background</div>`;
+                }
+            }
+            
+            // 4. Post-render: Scroll to the requested page specifically
+            const requestedPageNum = parseInt("{{ page_number }}");
+            const targetPageData = data.pages.find(p => p.page_number === requestedPageNum);
+            if (targetPageData) {
+                const targetEl = document.getElementById(`page-container-${targetPageData.id}`);
+                if (targetEl) {
+                    setTimeout(() => {
+                        targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 500); // Small delay to ensure layout is stable
+                }
             }
             
             console.log("Layout Overhaul: Workspace initialized via absolute positioning.");

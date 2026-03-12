@@ -1285,12 +1285,58 @@
             });
         }
     });
+ 
+    async function executeBlockAction(assignmentId, action) {
+        let reason = '';
+        if (action === 'reject') {
+            reason = prompt("Enter rejection reason:");
+            if (reason === null) return;
+        }
+
+        const confirmMsg = action === 'approve' ? "Approve this entire block?" : "Reject this entire block?";
+        if (!confirm(confirmMsg)) return;
+
+        try {
+            const url = action === 'approve' 
+                ? `/api/v1/processing/admin/assignments/${assignmentId}/approve/` 
+                : `/api/v1/processing/admin/assignments/${assignmentId}/reject/`;
+            
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'X-CSRFToken': '{{ csrf_token }}',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ 
+                    reason: action === 'reject' ? 'QUALITY_FAIL' : '',
+                    notes: reason 
+                })
+            });
+
+            if (response.ok) {
+                showToast(`Block ${action}d successfully`);
+                fetchDocuments();
+                // Optionally close and reopen details to refresh
+                const docDetailsModal = document.getElementById('doc-details-modal');
+                // If it's open, try to find current doc id and refresh
+                const docId = docDetailsModal.getAttribute('data-doc-id');
+                if (docId) showDocDetails(docId);
+            } else {
+                const err = await response.json();
+                showToast(`Failed: ${err.error || 'Unknown error'}`, 'error');
+            }
+        } catch (e) {
+            console.error(e);
+            showToast("Network error", "error");
+        }
+    }
 
     function showDocDetails(docId) {
         const doc = allDocuments.find(d => d.id === docId);
         if (!doc) return;
 
         const modal = document.getElementById('doc-details-modal');
+        modal.setAttribute('data-doc-id', docId);
         const content = document.getElementById('modal-doc-content');
 
         // Build assignments summary
@@ -1304,21 +1350,41 @@
                 const startedAt = res.viewed_at ? new Date(res.viewed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Not Started';
                 const submittedAt = res.completed_at ? new Date(res.completed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Pending';
 
-                return `
-                <div class="assignment-row">
-                    <div class="assignment-info">
-                        <div style="font-size: 1.2rem; display: flex; align-items: center;">
-                            ${res.completed_at ? '✅' : (res.viewed_at ? '👁️' : '⚪')}
+                let actionsHtml = '';
+                if (res.status_raw === 'SUBMITTED') {
+                    actionsHtml = `
+                        <div class="block-actions" style="margin-top: 10px; display: flex; gap: 8px;">
+                            <button class="btn btn-sm btn-success" onclick="executeBlockAction(${res.id}, 'approve')">Approve Block</button>
+                            <button class="btn btn-sm btn-danger" onclick="executeBlockAction(${res.id}, 'reject')">Reject Block</button>
+                            <a href="/processing/workspace/${doc.doc_ref}/${res.start_page}/" class="btn btn-sm btn-info" target="_blank">View Block</a>
                         </div>
-                        <div>
-                            <div class="assignment-user">${res.username} <small style="color:var(--text-muted)"> (Pages ${res.start_page}-${res.end_page})</small></div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;">
-                                <span>Started: ${startedAt}</span>
-                                <span style="margin-left: 10px;">Submitted: ${submittedAt}</span>
+                    `;
+                } else if (res.status_raw === 'APPROVED') {
+                    actionsHtml = `
+                        <div class="block-actions" style="margin-top: 10px;">
+                            <a href="/processing/workspace/${doc.doc_ref}/${res.start_page}/" class="btn btn-sm btn-info" target="_blank">View Edited Work</a>
+                        </div>
+                    `;
+                }
+
+                return `
+                <div class="assignment-row" style="flex-direction: column; align-items: flex-start;">
+                    <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
+                        <div class="assignment-info">
+                            <div style="font-size: 1.2rem; display: flex; align-items: center;">
+                                ${res.completed_at ? '✅' : (res.viewed_at ? '👁️' : '⚪')}
+                            </div>
+                            <div>
+                                <div class="assignment-user">${res.username} <small style="color:var(--text-muted)"> (Pages ${res.start_page}-${res.end_page})</small></div>
+                                <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;">
+                                    <span>Started: ${startedAt}</span>
+                                    <span style="margin-left: 10px;">Submitted: ${submittedAt}</span>
+                                </div>
                             </div>
                         </div>
+                        <span class="status-pill ${statusClass}">${res.status}</span>
                     </div>
-                    <span class="status-pill ${statusClass}">${res.status}</span>
+                    ${actionsHtml}
                 </div>
             `;
             }).join('');
