@@ -55,11 +55,9 @@
         <!-- Dynamic sidebar that switches content based on the user's role (CLIENT or RESOURCE) -->
         <aside class="app-sidebar">
             <div class="sidebar-nav">
-                 <div class="sidebar-brand">
-        <img src="{% static 'img/logo.png' %}" 
-            alt="XBERRA TAGGER"
-            class="sidebar-logo" style="width: 150px;">
-    </div>
+                <div class="sidebar-brand-box">
+                    <img src="{% static 'img/logo.png' %}" alt="XBERRA TAGGER" class="sidebar-logo-img">
+                </div>
                 {% if user.role == "CLIENT" %}
                 <a href="{% url 'client_upload' %}"
                     class="sidebar-link {% if request.resolver_match.url_name == 'client_upload' %}active{% endif %}">
@@ -117,7 +115,7 @@
                 <form action="{% url 'logout' %}" method="post" style="margin-top:auto;">
                     {% csrf_token %}
                     <button type="submit" class="sidebar-link"
-                        style="background:none; border:none; width:100%; cursor:pointer; text-align:left;">
+                        style="background:none; border:none; width:calc(100% - 1.5rem); cursor:pointer; text-align:left;">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2">
                             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
@@ -134,11 +132,9 @@
         {% if request.resolver_match.namespace == 'admin_panel' %}
         <!-- Dedicated sidebar for the Administrative Console -->
         <aside class="ac-sidebar">
-             <div class="sidebar-brand">
-        <img src="{% static 'img/logobg.png' %}" 
-            alt="XBERRA TAGGER"
-            class="sidebar-logo" style="width: 258px    ;">
-    </div>
+            <div class="ac-sidebar-brand-box">
+                <img src="{% static 'img/logobg.png' %}" alt="XBERRA TAGGER" class="sidebar-logo-img">
+            </div>
             <nav class="ac-nav">
                 <a href="{% url 'admin_panel:dashboard' %}"
                     class="ac-nav-link {% if request.resolver_match.view_name == 'admin_panel:dashboard' %}active{% endif %}">

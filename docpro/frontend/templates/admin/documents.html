@@ -851,7 +851,7 @@
                         const viewUrl = `/workspace/${doc.doc_ref || doc.id}/${res.start_page}/`;
 
                         let approveBtn = '';
-                        if (res.status_raw === 'SUBMITTED') {
+                        if (res.status_raw === 'SUBMITTED' && doc.pipeline_status === 'ALL_SUBMITTED') {
                             approveBtn = `<button onclick="event.stopPropagation(); approveAssignment('${res.id}')" class="trace-action-btn trace-btn-approve">Approve</button>`;
                         }
 
@@ -944,7 +944,7 @@
                 <button onclick="event.stopPropagation(); retryDocument('${doc.id}')" class="ac-btn btn-retry">Retry</button>`;
             }
 
-            if (doc.pipeline_status === 'REVIEWING' || doc.pipeline_status === 'ALL_SUBMITTED' || (doc.pipeline_status === 'MERGED' && !doc.final_file)) {
+            if (doc.pipeline_status === 'ALL_SUBMITTED' || (doc.pipeline_status === 'MERGED' && !doc.final_file)) {
                 actions += `
                 <button onclick="event.stopPropagation(); handleAction('${doc.id}', 'approve')" class="ac-btn btn-approve">Approve</button>`;
             }
@@ -1351,7 +1351,7 @@
                 const submittedAt = res.completed_at ? new Date(res.completed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Pending';
 
                 let actionsHtml = '';
-                if (res.status_raw === 'SUBMITTED') {
+                if (res.status_raw === 'SUBMITTED' && doc.pipeline_status === 'ALL_SUBMITTED') {
                     actionsHtml = `
                         <div class="block-actions" style="margin-top: 10px; display: flex; gap: 8px;">
                             <button class="btn btn-sm btn-success" onclick="executeBlockAction(${res.id}, 'approve')">Approve Block</button>
